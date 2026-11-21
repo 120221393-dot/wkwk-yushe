@@ -1,0 +1,1509 @@
+// 预设更新编辑器 · iframe 应用（原 index.js 活跃功能均迁到这里）：面板生命周期与销毁、
+// 状态/渲染、条目与正则对比/迁移、拖拽排序与自动滚动、变量面板、同步滚动等。
+import {
+  buildRows,
+  clone,
+  createIdentifier,
+  transferRegexScripts,
+  contentSimilarity as calculateContentSimilarity,
+  diffLines,
+  equalValues,
+  findPromptOrderEntry as promptOrderEntry,
+  getRegexGroupModel,
+  getRegexScripts,
+  pairRegexScripts,
+  validatePreset as validate,
+} from '../features/preset/core.js';
+import { listProjects, readProject, writeProject, removeProject, readUiPreferences, writeUiPreferences } from './project-storage.js';
+import { buildSearchRows, plainSearchRows, normalizeSearchQuery } from '../features/preset/ui/search-highlight.js';
+import { applyReplacementPlan } from '../features/preset/text-replace.js';
+import { runReplacementTask } from '../features/preset/ui/text-replace-runner.js';
+import { applyPromptDraft, isPendingPromptDraft, buildPresetDraftSnapshot } from '../features/preset/entry-drafts.js';
+import { createTextReplacePanel } from '../features/preset/ui/text-replace-panel.js';
+import { transferPresetGroup } from '../features/preset/group-transfer.js';
+import {planPromptDrops} from '../features/preset/prompt-drop-copy.js';
+import { setPresetGroupEnabled } from '../features/preset/group-toggle.js';
+import {comparePromptPairs} from '../features/preset/prompt-pairs.js';
+import { applyMigration } from '../features/preset/migration.js';
+import { openMigrationDialog } from '../features/preset/ui/migration-dialog.js';
+import {removePresetGroup} from '../features/preset/group-delete.js';
+import {chooseGroupRemoval} from '../features/preset/ui/group-delete-dialog.js';
+import {choosePresetSave} from '../features/preset/ui/save-drafts-dialog.js';
+import { installPresetGroupDrag } from '../features/preset/ui/group-drag.js';
+import { indexPromptOrder, indexedPromptEnabled, indexedPromptInjected } from '../features/preset/ui/list-order-index.js';
+import { createPromptRangeGroup } from '../features/preset/native-groups.js';
+import { createWorkbenchSelects } from '../features/worldbook/ui/worldbook-select.js';
+import {createRegexEditor} from '../features/preset/ui/regex-editor.js';
+import {editRegexScript,groupRegexScripts,deleteRegexScripts,renameRegexGroup,removeRegexGroup} from '../features/preset/regex-edit.js';
+import { host } from './bridge/bridge.js';
+import {createDiagnosticsAction} from './diagnostics.js';
+import {createStitchSession} from '../features/preset/ai-stitch/session.js';
+import {createAiStitchPanel} from '../features/preset/ui/ai-stitch-panel.js';
+const stitchSessions=new Map();let stitchPanel=null;
+async function openAiStitch(){
+ try{
+  closeTextReplacePanels();
+  const side=singleSide;if(!side||!state[side]?.prompts?.length)throw Error('请先在单栏加载主预设');
+  const form=document.querySelector('.pcm-inline-form');
+  if(form&&inlineDrafts.has(byId(side).get(form.dataset.id))){if(!(await pcmConfirm('当前条目表单尚未保存。先保存到编辑器草稿，再以该草稿开始缝合？取消可返回继续编辑。')))return;applyInlineForm(form);}
+  const baseline=JSON.stringify(state[side]),key=side+':'+state[side+'Name']+':'+baseline;
+  // 会话包含未添加的输入、已选材料和确认状态；切换基线不能静默淘汰用户草稿。
+  let session=stitchSessions.get(key);if(!session){session=createStitchSession({side,name:state[side+'Name']||'预设',baseline:state[side],dirty:state.dirty[side],source:state.tavernSource[side]});stitchSessions.set(key,session);}
+  stitchPanel?.dispose();state.activeId=null;state.activeSide=null;
+  const detail=document.querySelector('[data-compare]');detail._pcmDisposeHighlight?.();detail.replaceChildren();detail.classList.remove('pcm-hidden');detail.closest('.pcm-app').classList.add('pcm-single-detail');
+  stitchPanel=createAiStitchPanel({session,host,isCurrent:()=>JSON.stringify(state[side])===baseline&&state.tavernSource[side]===session.source,onBack:()=>hideCompare(),
+   askName:pcmPrompt,confirm:pcmConfirm,toast:(message,kind)=>pcmToast(message,kind),onRestore:()=>void openAiStitch(),onArchive:archiveStitchDrafts,onMerge:async(result,s)=>{
+    if(JSON.stringify(state[side])!==baseline||state.tavernSource[side]!==s.source)throw Error('主预设已改变，未加入草稿，请重新生成');
+    for(const {panel} of variablePanels.values())if(panel.hasDraft?.())throw Error('变量面板有未提交草稿，请先处理');
+    const before=state[side],next=result.preset,byOld=new Map(before.prompts.map(p=>[p.identifier,p]));
+    for(const change of result.changes)if(inlineDrafts.has(byOld.get(change.id)))throw Error('变量初始化／读取目标条目有未提交表单，请先保存该表单再缝合');
+    // 不变的条目保留对象身份，避免WeakMap中的正文表单草稿脱落。
+    next.prompts=next.prompts.map(p=>equalValues(p,byOld.get(p.identifier))?byOld.get(p.identifier):p);
+    const oldRegex=getRegexScripts(before),newRegex=getRegexScripts(next);oldRegex.forEach((p,i)=>{if(regexDrafts.has(p)&&newRegex[i])regexDrafts.set(newRegex[i],clone(regexDrafts.get(p)));});
+    pushUndo({type:'stitch',side,before,dirtyBefore:state.dirty[side],modifiedBefore:[...state.modified[side]],draggedBefore:[...state.dragged[side]]});
+    textReplaceLineages.set(next,getTextReplaceLineage(before));state[side]=next;state.dirty[side]=true;state.query[side]='';state.filter[side]='all';
+    for(const added of result.added){state.modified[side].add(added.id);const gid=next.extensions?.baibaiToolkit?.presetPromptGroups?.prompts?.[added.id]?.groupId;if(gid)state.groupCollapsed['g:'+side+':'+gid]=false;}
+    for(const change of result.changes)state.modified[side].add(change.id);
+    closeVariablesPanel();closeRegexPanel();state.activeId=null;state.activeSide=null;stitchPanel?.dispose();hideCompare();rebuildCache();renderAll(false);updateUndoButton();stitchSessions.delete(key);
+    const first=result.added[0]?.id;requestAnimationFrame(()=>{const button=[...document.querySelectorAll('[data-open]')].find(e=>e.dataset.open===first&&e.dataset.side===side);button?.scrollIntoView({block:'center'});});
+    pcmToastr.success('已按方案位置和分组加入主预设草稿，可一次撤回；点击保存后才会写回酒馆。');
+   },onSave:async(result,s)=>{
+    // Archive again after the HTTP await: the user may have edited either pane while it was in flight.
+    try{await archiveStitchDrafts();}catch(error){const e=Error('新预设「'+result.name+'」已写入并核验通过，但切换双栏前备份当前草稿失败：'+(error.message||String(error))+'。处理后点击“只读复查保存状态”即可完成切换，不会重复写入。');e.name='StitchHandoffPending';throw e;}
+    closeVariablesPanel();closeRegexPanel();
+    if(singleSide)setSingleSide(singleSide);
+    state.old=clone(s.baseline);state.new=clone(result.preset);resetImportedGroups('old');resetImportedGroups('new');state.oldName=s.originalName+'.json';state.newName=result.name+'.json';
+    state.tavernSource={old:s.source,new:result.name};state.dirty={old:s.dirty,new:false};state.query={old:'',new:''};state.filter={old:'all',new:'all'};
+    state.dragged={old:new Set(),new:new Set()};state.modified={old:new Set(),new:new Set()};state.history=[];state.projectId=null;
+    state.freeSelect={enabled:false,oldId:null,newId:null};state.multiSelect.selected={old:new Set(),new:new Set()};state.grouping={side:null,groupId:null};state.activeId=null;state.activeSide=null;
+    hideCompare();rebuildCache();renderAll(false);updateUndoButton();await refreshProjects();stitchSessions.delete(key);pcmToastr.success('新预设已读盘核验；已切换双栏。原两侧草稿保存在“AI缝合前备份”项目。');
+   }});
+  detail.append(stitchPanel.element);
+  const previous=[...stitchSessions.values()].filter(s=>s!==session&&s.sources.length);
+  if(previous.length){const recovery=el('select');recovery.setAttribute('aria-label','恢复先前缝合材料');recovery.append(new Option('恢复先前缝合材料（保留现有输入）',''));previous.forEach((s,i)=>recovery.append(new Option(s.originalName+' · '+s.sources.length+' 项',String(i))));recovery.addEventListener('change',()=>{if(recovery.value===''||session.saveId||session.status==='generating')return;const old=previous[Number(recovery.value)];session.sources.push(...clone(old.sources).map(s=>({...s,id:createIdentifier()})));session.guidance=session.guidance||old.guidance;session.touch();void openAiStitch();});detail.prepend(recovery);}
+ }catch(error){pcmToastr.error(error.message);}
+}
+async function archiveStitchDrafts(){
+ for(const {panel} of variablePanels.values())if(panel.hasDraft?.())throw Error('变量面板还有未保存表单或预览。请先在变量面板保存或明确放弃；本次未覆盖这些草稿。');
+ const data=projectData('AI缝合前备份 '+new Date().toLocaleString());
+ await writeProject(data);
+}
+function captureFormDrafts(){return Object.fromEntries(['old','new'].map(side=>[side,{inline:(state[side]?.prompts||[]).flatMap(p=>inlineDrafts.has(p)?[[p.identifier,clone(inlineDrafts.get(p))]]:[]),regex:getRegexScripts(state[side]||{}).flatMap((p,i)=>regexDrafts.has(p)?[[i,clone(regexDrafts.get(p))]]:[])}]));}
+function restoreFormDrafts(data){for(const side of ['old','new']){for(const [id,draft] of data.formDrafts?.[side]?.inline||[]){const p=state[side]?.prompts.find(p=>p.identifier===id);if(p)inlineDrafts.set(p,draft);}for(const [i,draft] of data.formDrafts?.[side]?.regex||[]){const p=getRegexScripts(state[side]||{})[i];if(p)regexDrafts.set(p,draft);}}state.tavernSource=data.tavernSource||{old:null,new:null};state.dirty=data.dirty||{old:true,new:true};}
+import { installVariableReferencePicker } from '../features/preset/ui/variable-reference-picker.js';
+import { installEntryTools } from '../features/preset/ui/entry-tools.js';
+import { openPresetCheckPanel } from '../features/preset/ui/preset-check-panel.js';
+import { collectCheckContext } from '../features/preset/preset-check-context.js';
+import { checkEntrySymbols, checkPresetStructure } from '../features/preset/syntax-check.js';
+import { openVariablesPanel } from '../features/preset/ui/variables-panel.js';
+import { applyVariableChanges } from '../features/preset/variables.js';
+let presetGroupDrag = null;
+let variablePanel = null;
+const variablePanels = new Map();
+function closeVariablesPanel(){for(const {panel} of variablePanels.values())panel.destroy();variablePanels.clear();variablePanel=null;}
+function openVarPanel(side){
+  const preset=state[side];
+  if(!preset?.prompts?.length){pcmToastr.warning('请先导入这一侧的预设');return;}
+  variablePanel?.hide();
+  const previous=variablePanels.get(side);
+  if(previous?.preset===preset){variablePanel=previous.panel;variablePanel.show();return;}
+  previous?.panel.destroy();
+  variablePanel=openVariablesPanel({dialog:document.getElementById(APP_ID+'-dialog'),title:(side==='old'?'旧版':'新版')+' · '+state[side+'Name'],
+    getPrompts(){if(state[side]!==preset)throw new Error('预设已重新载入，请关闭后重新打开变量面板');return preset.prompts;},
+    isInjected(id){const prompt=byId(side).get(id);return prompt&&isInjected(side,prompt);},
+    getPresentation(){
+      const meta=groupMeta(side),items=ordered(side);
+      return [...items.filter(p=>isInjected(side,p)),...items.filter(p=>!isInjected(side,p))].map(p=>{
+        const raw=meta?.state.prompts?.[p.identifier]?.groupId,group=raw&&meta?.groups.get(String(raw));
+        return {id:p.identifier,groupId:!isInjected(side,p)?'uninjected':group?String(group.id):'',groupName:!isInjected(side,p)?'未注入':group?.name||'未分组',grouped:!!meta||!isInjected(side,p)};
+      });
+    },
+    confirm:pcmConfirm,undo:undoLast,
+    apply(changes){
+      if(state[side]!==preset)throw new Error('预设已重新载入，请重新打开变量面板');
+      const prompts=applyVariableChanges(preset.prompts,changes);
+      if(!changes.length)return;
+      pushUndo({type:'variables',side,prompts:clone(preset.prompts),modifiedBefore:[...state.modified[side]]});
+      preset.prompts=prompts;
+      for(const change of changes)state.modified[side].add(change.id);
+      state.dirty[side]=true;rebuildCache();renderAll();
+    },
+  });
+  variablePanels.set(side,{preset,panel:variablePanel});
+}
+import { createToolboxHome } from './home/home.js';
+import {normalizeEditorPreferences,initializeImportedGroups} from '../features/preset/editor-preferences.js';
+import {openEditorSettings} from '../features/preset/ui/editor-settings.js';
+let editorPreferences=normalizeEditorPreferences();
+function setEditorPreferences(value){editorPreferences=normalizeEditorPreferences(value);}
+function resetImportedGroups(side){initializeImportedGroups(state.groupCollapsed,side,state[side],editorPreferences.collapseGroups);}
+function showEditorSettings(){openEditorSettings({parent:shell(),host,onPreferences:setEditorPreferences});}
+import { createSnapshotPanel } from '../features/snapshot/ui/snapshot-panel.js';
+let snapshotPanel = null;
+import {createWorldbookWorkbench,createWorkbenchSession} from '../features/worldbook/ui/worldbook-workbench.js';
+let worldbookWorkbench=null;
+const worldbookSession=createWorkbenchSession();
+import { installPaneLayout } from '../features/preset/ui/pane-layout.js';
+let paneLayout = null;
+import { stitchWorldbook } from '../features/worldbook/worldbook.js';
+import { openWorldbookPanel, createWorldbookImportSession } from '../features/worldbook/ui/worldbook-panel.js';
+const worldbookImportSession = createWorldbookImportSession();
+import { beginWorldbookPlacement } from '../features/worldbook/ui/worldbook-placement.js';
+
+
+import { createTempLibrarySession, addTempLibraryEntries, prepareTempLibraryInsert } from '../features/worldbook/temp-library.js';
+import { createTempLibraryPanel } from '../features/worldbook/ui/temp-library-panel.js';
+import { createTempLibraryPreview, alignTempLibraryBodies } from '../features/worldbook/ui/temp-library-preview.js';
+import { installTempLibraryDrag } from '../features/worldbook/ui/temp-library-drag.js';
+const tempLibrarySession = createTempLibrarySession();
+let tempLibrarySide = null, tempLibraryPanel = null, tempLibraryDrag = null, tempLibraryCovered = null;
+let tempLibrarySelection={preset:null,promptId:null,itemId:null};
+function resetTempLibrarySelection(){tempLibrarySelection={preset:tempLibrarySide?state[tempLibrarySide]:null,promptId:null,itemId:null};}
+function syncTempLibrarySelection(){
+  if(!tempLibrarySide)return;
+  if(tempLibrarySelection.preset!==state[tempLibrarySide])resetTempLibrarySelection();
+  tempLibrarySelection.promptId=state.activeSide===tempLibrarySide&&byId(tempLibrarySide).has(state.activeId)?state.activeId:null;
+  if(!tempLibrarySession.items.has(tempLibrarySelection.itemId))tempLibrarySelection.itemId=null;
+  tempLibraryPanel?.refreshSelection();
+}
+function selectTempLibraryPrompt(id){
+  if(!tempLibrarySide||!byId(tempLibrarySide).has(id))return;
+  syncTempLibrarySelection();state.activeId=tempLibrarySelection.promptId===id?null:id;state.activeSide=state.activeId?tempLibrarySide:null;
+  if(!state.activeId)hideCompare();renderAll(true,true);
+}
+function selectTempLibraryItem(id){
+  if(!tempLibrarySide||!state.freeSelect.enabled||!tempLibrarySession.items.has(id))return;
+  syncTempLibrarySelection();tempLibrarySelection.itemId=tempLibrarySelection.itemId===id?null:id;
+  tempLibraryPanel?.refreshSelection();
+  if(tempLibrarySelection.promptId)renderTempLibraryDetail(true);else pcmToastr.info('已选择世界书条目，请再选择一个预设条目');
+}
+function onTempLibraryMaterialsChange(){syncTempLibraryControls();if(tempLibrarySide&&state.activeId)renderTempLibraryDetail(false);}
+function syncTempLibraryControls() {
+  for (const button of document.querySelectorAll('[data-action=toggle-temp-library]')) {
+    button.textContent = '临时库' + (tempLibrarySession.items.size ? ' (' + tempLibrarySession.items.size + ')' : '');
+    button.setAttribute('aria-pressed', String(tempLibrarySide === button.dataset.side));
+    button.disabled = !state[button.dataset.side];
+  }
+  for (const input of document.querySelectorAll('[data-sync-scroll]')) {
+    input.disabled=!!tempLibrarySide;
+    if(tempLibrarySide)input.setAttribute('aria-description','临时库打开时暂停，收起后恢复');else input.removeAttribute('aria-description');
+  }
+  syncTempLibrarySelection();
+  if (!tempLibrarySide) return;
+  const list = document.querySelector('[data-list="'+tempLibrarySide+'"]');
+  if (list && !list.querySelector('[data-temp-drop-end]')) { const end = el('div','pcm-temp-drop-end','拖到这里加入预设末尾（未分组）'); end.dataset.tempDropEnd=''; list.append(end); }
+}
+function closeTempLibrary(render=true) {
+  const covered=tempLibraryCovered,wasOpen=!!tempLibrarySide;tempLibraryCovered=null;
+  tempLibraryDrag?.destroy();tempLibraryDrag=null;
+  if(covered?.grip&&covered.parent.isConnected)covered.parent.insertBefore(covered.grip,covered.next);
+  tempLibraryPanel?.destroy();tempLibraryPanel=null;tempLibrarySide=null;
+  const app=document.querySelector('.pcm-app');app?.classList.remove('pcm-with-library');if(app)delete app.dataset.librarySide;resetTempLibrarySelection();
+  covered?.pane.classList.remove('pcm-library-obscured');
+  document.querySelectorAll('[data-temp-drop-end]').forEach(node=>node.remove());
+  cancelAnimationFrame(syncScrollRaf);syncScrollRaf=0;syncScrollPair=null;syncScrollGuard=false;
+  if(wasOpen){state.activeId=null;state.activeSide=null;hideCompare();}
+  syncTempLibraryControls();
+  if(wasOpen&&render)renderAll();
+  if(covered?.list.isConnected)covered.list.scrollTop=covered.top;
+  if(wasOpen)paneLayout?.refresh();
+}
+function openTempLibrary(side) {
+  if (!state[side]) { pcmToastr.warning('请先导入这一侧的预设'); return; }
+  closeTempLibrary(false);worldbookPlacement?.cancel(false);worldbookPlacement=null;closeTextReplacePanels();closeMigrationDialog();closeRegexPanel();
+  if(singleSide)setSingleSide(singleSide);
+  state.activeId=null;state.activeSide=null;hideCompare();cleanupPointerDrag();cleanupTouchDrag();paneLayout?.cancel();
+  cancelAnimationFrame(syncScrollRaf);syncScrollRaf=0;syncScrollPair=null;syncScrollGuard=false;
+  tempLibrarySide=side;resetTempLibrarySelection();const dialog=document.getElementById(APP_ID+'-dialog'),app=dialog.querySelector('.pcm-app');
+  const opposite=side==='old'?'new':'old',list=app.querySelector('[data-list="'+opposite+'"]'),pane=list.closest('.pcm-pane');
+  tempLibraryCovered={pane,list,top:list.scrollTop};
+  tempLibraryPanel=createTempLibraryPanel({session:tempLibrarySession,onAdd:()=>manageWorldbook(side),onClose:()=>closeTempLibrary(),confirm:pcmConfirm,onChange:onTempLibraryMaterialsChange,isCompareMode:()=>state.freeSelect.enabled,getSelectedId:()=>state.freeSelect.enabled?tempLibrarySelection.itemId:null,onSelect:selectTempLibraryItem});
+  const library=tempLibraryPanel.element;library.dataset.replacesSide=opposite;library.id=dialog.id+'-temp-library';
+  pane.before(library);pane.classList.add('pcm-library-obscured');app.classList.add('pcm-with-library');app.dataset.librarySide=side;
+  // 保留原两侧 DOM 与比例手柄；被遮住的新版手柄临时借给库，收起后归还。
+  const grip=pane.querySelector('.pcm-pane-resizer');
+  if(grip){Object.assign(tempLibraryCovered,{grip,parent:grip.parentNode,next:grip.nextSibling});library.querySelector('.pcm-temp-head').insertBefore(grip,library.querySelector('.pcm-temp-head button'));}
+  tempLibraryDrag=installTempLibraryDrag(dialog,{prepare(id){
+    const item=tempLibrarySession.items.get(id),preset=state[side];
+    if(!item||!preset||isSideSavePending(side))return null;
+    return {item,side,preset,order:JSON.stringify([preset.prompt_order,preset.extensions?.baibaiToolkit?.presetPromptGroups])};
+  },resolve:resolveTempLibraryDrop,commit:commitTempLibraryDrop,lock:pcmLock,unlock:pcmUnlock,scrollEdge:dragAutoScrollEdge});
+  renderAll();syncTempLibraryControls();paneLayout?.refresh();
+}
+function isTempLibraryTargetCurrent(data) {
+  return tempLibrarySide===data.side&&!singleSide&&state[data.side]===data.preset&&tempLibrarySession.items.get(data.item.id)===data.item
+    &&!isSideSavePending(data.side)&&!document.querySelector('.pcm-app')?.classList.contains('pcm-view-hidden')
+    &&data.order===JSON.stringify([data.preset.prompt_order,data.preset.extensions?.baibaiToolkit?.presetPromptGroups]);
+}
+function resolveTempLibraryDrop(data,hit,{y}) {
+  if(!isTempLibraryTargetCurrent(data)||!hit)return null;
+  const list=hit.closest('.pcm-list[data-list]');if(!list||list.dataset.list!==data.side||hit.closest('.pcm-uninjected'))return null;
+  const preset=data.preset,ids=(promptOrderEntry(preset)?.order||[]).map(x=>typeof x==='string'?x:x.identifier),groups=preset.extensions?.baibaiToolkit?.presetPromptGroups;
+  const row=hit.closest('.pcm-row');
+  if(row){const id=row.dataset.dragId;if(!ids.includes(id))return null;const r=row.getBoundingClientRect(),after=y>r.top+r.height/2;
+    return {marker:row,className:after?'pcm-temp-after':'pcm-temp-before',label:'插入「'+(byId(data.side).get(id)?.name||'未命名条目')+'」'+(after?'之后':'之前'),...(after?{afterId:id}:{beforeId:id}),groupId:String(groups?.prompts?.[id]?.groupId||'')};}
+  const group=hit.closest('.pcm-group[data-group-id]');
+  if(group){const groupId=group.dataset.groupId;if(!groups?.groups?.some(g=>String(g.id)===groupId))return null;
+    const members=ids.filter(id=>String(groups.prompts?.[id]?.groupId||'')===groupId);
+    return {marker:group,className:'pcm-temp-group',label:'加入「'+(groups.groups.find(g=>String(g.id)===groupId)?.name||'分组')+'」末尾',...(members.length?{afterId:members.at(-1)}:{placement:'end'}),groupId};}
+  return {marker:hit.closest('[data-temp-drop-end]')||list,className:'pcm-temp-end',label:'加入预设末尾（未分组）',placement:'end',groupId:''};
+}
+function commitTempLibraryDrop(data,target) {
+  try {
+    if(!isTempLibraryTargetCurrent(data))throw Error('目标预设或材料已变化，请重新拖拽。');
+    const {marker,className,label,...placement}=target,side=data.side,preset=data.preset,result=prepareTempLibraryInsert(preset,data.item,placement);
+    const snapshot={...moveSnapshot(side),tempLibrary:true,preset,dirtyBefore:state.dirty[side],savedRevision:getTextReplaceLineage(preset).savedRevision,beforeSignature:JSON.stringify(preset)};
+    // 原扩展引用用于撤回，保留其正则表单草稿；新增只替换分组分支。
+    snapshot.extensionsBefore=preset.extensions;
+    pushUndo(snapshot);preset.prompts=result.preset.prompts;preset.prompt_order=result.preset.prompt_order;
+    if(result.preset.extensions!==undefined)preset.extensions=result.preset.extensions;
+    for(const id of result.identifiers){state.dragged[side].add(id);const groupId=preset.extensions?.baibaiToolkit?.presetPromptGroups?.prompts?.[id]?.groupId;if(groupId)state.groupCollapsed['g:'+side+':'+groupId]=false;}
+    state.dirty[side]=true;state.query[side]='';state.filter[side]='all';
+    const search=document.querySelector('[data-search="'+side+'"]');if(search)search.value='';const filter=document.querySelector('[data-filter="'+side+'"]');if(filter)filter.value='all';
+    rebuildCache();renderAll();
+    requestAnimationFrame(()=>{const list=document.querySelector('[data-list="'+side+'"]'),row=rowById(list,result.identifiers[0]);if(row&&list){row.classList.add('pcm-temp-inserted');setTimeout(()=>row.classList.remove('pcm-temp-inserted'),1600);const a=row.getBoundingClientRect(),b=list.getBoundingClientRect();list.scrollTop+=a.top-b.top-list.clientHeight/2+a.height/2;}});
+    pcmToastr.success('已加入预设草稿，可撤回；保存后写回酒馆');
+  }catch(error){pcmToastr.warning(error.message);}
+}
+
+let worldbookPlacement = null;
+function manageWorldbook(side) {
+  worldbookPlacement?.cancel(false);
+  const preset = state[side];
+  if (!preset) { pcmToastr.warning('请先导入这一侧的目标预设'); return; }
+  const dialog = document.getElementById(APP_ID+'-dialog');
+  const apply = (entries, options) => {
+    if (state[side] !== preset) throw new Error('目标预设已切换或重新载入，请关闭面板后重新选择。');
+    const result = stitchWorldbook(preset, entries, options);
+    pushUndo(moveSnapshot(side));
+    preset.prompts = result.preset.prompts;
+    preset.prompt_order = result.preset.prompt_order;
+    if (result.preset.extensions !== undefined) preset.extensions = result.preset.extensions;
+    for (const id of result.identifiers) state.dragged[side].add(id);
+    state.dirty[side] = true;
+    state.query[side] = ''; state.filter[side] = 'all';
+    const search = document.querySelector('[data-search="'+side+'"]'); if (search) search.value = '';
+    const filter = document.querySelector('[data-filter="'+side+'"]'); if (filter) filter.value = 'all';
+    rebuildCache(); renderAll();
+    pcmToastr.success('已缝合 '+result.identifiers.length+' 条到'+(side==='old'?'旧版':'新版')+'草稿，可撤回；点击「保存」后写回酒馆');
+  };
+  openWorldbookPanel({
+    dialog,
+    session: worldbookImportSession,
+    title: (side === 'old' ? '旧版' : '新版') + ' · ' + state[side+'Name'],
+    onApply: apply,
+    onCollect(entries,options) { if(state[side]!==preset)throw Error('目标预设已切换，请重新打开世界书'); const result=addTempLibraryEntries(tempLibrarySession,entries,options);openTempLibrary(side);pcmToastr.success('已加入 '+result.added+' 条到临时库'+(result.skipped?'，跳过 '+result.skipped+' 条已有材料':'')); },
+    onPick(entries, options, callbacks) {
+      hideCompare();
+      worldbookPlacement = beginWorldbookPlacement({
+        dialog, side, count: entries.length,
+        getPrompt(id) {
+          if (state[side] !== preset || !promptOrderEntry(preset)?.order?.some(item => (typeof item === 'string' ? item : item?.identifier) === id)) return null;
+          return preset.prompts.find(prompt => prompt.identifier === id);
+        },
+        onApply(position) { apply(entries, { ...options, ...position }); callbacks.done(); },
+        onCancel: callbacks.restore,
+      });
+    },
+  });
+}
+
+const APP_ID='preset-compare-migrator';const APP_TITLE='酒馆盒子';
+let toolboxView='home';
+function toolboxHome(){const home=createToolboxHome({themeIcon:UI_THEME_ICONS[state.uiTheme]||'',onCycleTheme:cycleUiTheme});home.querySelector('.pcm-toolbox-home-actions').prepend(createDiagnosticsAction({host,toast:pcmToast,className:'pcm-home-diagnostics'}));return home;}
+function closeSnapshotPanel(){snapshotPanel?.destroy();snapshotPanel=null;}
+function closeWorldbookWorkbench(){worldbookWorkbench?.destroy();worldbookWorkbench=null;}
+let panelClosePending=false;
+async function requestPanelClose(){
+  if(panelClosePending)return;
+  if(worldbookWorkbench){await worldbookWorkbench.requestClose();return;}
+  panelClosePending=true;
+  try{
+    document.getElementById(APP_ID+'-dialog')?.close();
+  }finally{panelClosePending=false;}
+}
+function showWorldbookWorkbench(){
+  const dialog=document.getElementById(APP_ID+'-dialog');if(!dialog)return;
+  closeSnapshotPanel();closeWorldbookWorkbench();toolboxView='worldbooks';paneLayout?.cancel();
+  dialog.querySelector('.pcm-toolbox-home')?.classList.add('pcm-view-hidden');dialog.querySelector('.pcm-app')?.classList.add('pcm-view-hidden');
+  worldbookWorkbench=createWorldbookWorkbench({host,session:worldbookSession,onBack:showToolbox,onClose:()=>dialog.close(),onCycleTheme:cycleUiTheme,themeIcon:UI_THEME_ICONS[state.uiTheme]||'',prompt:pcmPrompt,confirm:pcmConfirm,toast:pcmToastr});
+  dialog.append(worldbookWorkbench.element);dialog.scrollTop=0;
+}
+// 快捷入口记住快照页；存储不可用时保留本次 iframe 会话选择。
+const QUICK_VIEW_KEY='preset-compare-migrator.quick-view';
+let quickView='snapshots';
+try{if(localStorage.getItem(QUICK_VIEW_KEY)!=='snapshots')quickView='snapshots';}catch{}
+function rememberQuickView(view){quickView=view;try{localStorage.setItem(QUICK_VIEW_KEY,view);}catch{}}
+function showQuickView(){showSnapshots(true);}
+function showSnapshots(quick=false){
+  const dialog=document.getElementById(APP_ID+'-dialog');if(!dialog)return;
+  closeSnapshotPanel();closeWorldbookWorkbench();toolboxView='snapshots';if(quick)rememberQuickView('snapshots');paneLayout?.cancel();
+  dialog.querySelector('.pcm-toolbox-home')?.classList.add('pcm-view-hidden');
+  dialog.querySelector('.pcm-app')?.classList.add('pcm-view-hidden');
+  snapshotPanel=createSnapshotPanel({quick,host,onBack:showToolbox,onClose:()=>void requestPanelClose(),onCycleTheme:cycleUiTheme,themeIcon:UI_THEME_ICONS[state.uiTheme]||'',prompt:pcmPrompt,confirm:pcmConfirm,toast:pcmToastr});
+  dialog.append(snapshotPanel.element);dialog.scrollTop=0;void snapshotPanel.refresh();
+}
+// 页面切换清掉外层滚动，避免矮屏首页/详情的滚动偏移把新页面头部推入安全区。
+function showToolbox(){closeSnapshotPanel();closeWorldbookWorkbench();const dialog=document.getElementById(APP_ID+'-dialog');if(!dialog)return;toolboxView='home';paneLayout?.cancel();dialog.querySelector('.pcm-toolbox-home')?.classList.remove('pcm-view-hidden');dialog.querySelector('.pcm-app')?.classList.add('pcm-view-hidden');dialog.scrollTop=0;}
+function showEditor(){closeSnapshotPanel();closeWorldbookWorkbench();const dialog=document.getElementById(APP_ID+'-dialog');if(!dialog)return;toolboxView='editor';dialog.querySelector('.pcm-toolbox-home')?.classList.add('pcm-view-hidden');dialog.querySelector('.pcm-app')?.classList.remove('pcm-view-hidden');dialog.scrollTop=0;paneLayout?.refresh();restorePanelState(dialog);}
+/* 以下 4 个全局捕获监听原挂 document（面板关闭后仍常驻），现改为命名函数挂到 dialog（见 shell()），随面板销毁自动释放。 */
+function onToggleEnabledClick(event){const tag=event.target.closest?.('[data-toggle-enabled]');if(tag){togglePromptEnabled(tag.dataset.side,tag.dataset.toggleEnabled);event.preventDefault();event.stopPropagation();}}
+let tavernPresetPickerSide='old';
+let tavernPresetPickerData=new Map();
+function onTavernPickerClick(event){const target=event.target.closest?.('button');if(target?.dataset.action==='pull-tavern')tavernPresetPickerSide=target.dataset.side||'old';}
+// 配色常量须先初始化，再读取持久化偏好；否则 TDZ 会被回退逻辑吞掉。
+const UI_THEME_KEY='preset-compare-migrator.ui-theme';const UI_THEMES=[['auto','配色：自适应'],['day','配色：日间'],['night','配色：夜间']];const UI_THEME_ICONS={auto:'<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/></svg>',day:'<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>',night:'<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>'};function loadUiTheme(){try{const v=localStorage.getItem(UI_THEME_KEY);return UI_THEMES.some(x=>x[0]===v)?v:'auto';}catch(error){return 'auto';}}function saveUiTheme(v){try{localStorage.setItem(UI_THEME_KEY,v);}catch(error){}}
+const state={old:null,new:null,oldName:'',newName:'',query:{old:'',new:''},filter:{old:'all',new:'all'},activeId:null,activeSide:null,dirty:{old:false,new:false},grouping:{side:null,groupId:null},dragged:{old:new Set(),new:new Set()},modified:{old:new Set(),new:new Set()},history:[],projectId:null,ignoreWhitespace:false,showDiff:false,showSimilarity:false,syncScroll:false,showDraftMarkers:{old:false,new:false},uiTheme:loadUiTheme(),cache:{maps:{old:new Map(),new:new Map()},ordered:{old:[],new:[]},similarity:new Map(),rows:{old:new Map(),new:new Map()}}};
+
+state.freeSelect={enabled:false,oldId:null,newId:null}; state.multiSelect={enabled:false,selected:{old:new Set(),new:new Set()}};
+state.unInjectedCollapsed={old:true,new:true};state.groupCollapsed={};
+state.tavernSource={old:null,new:null};
+let hostEnvironment={theme:{},safeInsets:{top:0,right:0,bottom:0,left:0},keyboardOffset:0,viewport:null};
+const hostEnvironmentListeners=new Set();
+function applyHostEnvironment(environment){hostEnvironment=environment||hostEnvironment;for(const [name,value] of Object.entries(hostEnvironment.theme||{})){if(value)document.documentElement.style.setProperty(name,value);}for(const side of['top','right','bottom','left']){const inset=Math.max(0,Number(hostEnvironment.safeInsets?.[side])||0);document.documentElement.style.setProperty('--pcm-host-inset-'+side,inset+'px');}for(const listener of hostEnvironmentListeners){try{listener(hostEnvironment);}catch(error){console.error('[preset-compare-migrator] environment listener failed',error);}}}
+function onHostEnvironment(listener){hostEnvironmentListeners.add(listener);listener(hostEnvironment);return()=>hostEnvironmentListeners.delete(listener);}
+/* 自绘同步式对话框（confirm/prompt 替代）：Tauri/WebView2 宿主不支持 window.confirm/prompt
+   （静默返回 false/undefined，删除/新建分组等功能直接失灵），iframe 内也无法依赖宿主 polyfill。
+   用一个内嵌 dialog + 显示层 input 伪同步：Promise 化，调用点改 async/await。 */
+let pcmModal=null;
+function pcmModalBase(){if(pcmModal&&pcmModal.isConnected)return pcmModal;const d=el('dialog','pcm-modal');d.id=APP_ID+'-modal';const box=el('div','pcm-modal-box');box.append(el('div','pcm-modal-msg'));const row=el('div','pcm-modal-row');row.append(btn('确定','modal-ok','menu_button pcm-primary'),btn('取消','modal-cancel',''));box.append(row);d.append(box);document.getElementById(APP_ID+'-dialog')?.append(d)??document.body.append(d);pcmModal=d;return d;}
+function pcmShowModal(message,{withInput=false,defaultValue='',okText='确定',cancel=true}={}){const d=pcmModalBase();d.querySelector('.pcm-modal-msg').textContent=message;const row=d.querySelector('.pcm-modal-row');let input=d.querySelector('.pcm-modal-input');if(withInput){if(!input){input=el('input','pcm-modal-input');row.before(input);}input.value=defaultValue;}else if(input)input.remove();d.querySelector('[data-action=modal-ok]').textContent=okText;const cancelBtn=d.querySelector('[data-action=modal-cancel]');cancelBtn.hidden=!cancel;return new Promise(resolve=>{let settled=false;const done=v=>{if(settled)return;settled=true;d.close();d.remove();if(pcmModal===d)pcmModal=null;resolve(v);};const onKey=e=>{if(e.key==='Escape'){e.stopPropagation();done(null);}};const onClick=e=>{const t=e.target.closest?.('button');if(!t)return;if(t.dataset.action==='modal-ok')done(withInput?input.value:true);else if(t.dataset.action==='modal-cancel')done(null);};d.addEventListener('close',()=>{d.removeEventListener('click',onClick,true);d.removeEventListener('keydown',onKey,true);done(undefined);},{once:true});d.addEventListener('click',onClick,true);d.addEventListener('keydown',onKey,true);if(typeof d.showModal==='function')d.showModal();else d.setAttribute('open','');});}
+async function pcmConfirm(message){return (await pcmShowModal(message))===true;}
+async function pcmPrompt(message,value=''){const r=await pcmShowModal(message,{withInput:true,defaultValue:value});return r==null?null:String(r);}
+host.on('environment',applyHostEnvironment);
+/* 界面开关状态（自由选择/忽略空白/正文差异）持久化到 IndexedDB 的 prefs 仓库，重开插件后保留。 */
+async function saveUiPrefs(){
+  try{await writeUiPreferences({id:'ui',freeSelect:state.freeSelect.enabled,ignoreWhitespace:state.ignoreWhitespace,showDiff:state.showDiff,showSimilarity:state.showSimilarity,syncScroll:state.syncScroll,showDraftMarkers:{...state.showDraftMarkers}});}catch{}
+}
+async function loadUiPrefs(){
+  try{
+    const rec=await readUiPreferences();
+    if(!rec)return;
+    state.freeSelect.enabled=!!rec.freeSelect;state.ignoreWhitespace=!!rec.ignoreWhitespace;state.showDiff=!!rec.showDiff;state.showSimilarity=!!rec.showSimilarity;state.syncScroll=!!rec.syncScroll;
+    state.showDraftMarkers={old:!!rec.showDraftMarkers?.old,new:!!rec.showDraftMarkers?.new};
+    syncDraftControls();refreshDraftIndicators('old');refreshDraftIndicators('new');
+    for(const [selector,checked] of [['free-select',state.freeSelect.enabled],['ignore-whitespace',state.ignoreWhitespace],['show-similarity',state.showSimilarity],['sync-scroll',state.syncScroll]]){
+      const input=document.querySelector('[data-'+selector+']');
+      if(input)input.checked=checked;
+    }
+  }catch{}
+}
+function projectData(name,id){return{id:id||createIdentifier(),name,updatedAt:Date.now(),old:clone(state.old),new:clone(state.new),oldName:state.oldName,newName:state.newName,dragged:{old:[...state.dragged.old],new:[...state.dragged.new]},modified:{old:[...state.modified.old],new:[...state.modified.new]},filter:clone(state.filter),dirty:clone(state.dirty),tavernSource:clone(state.tavernSource),formDrafts:captureFormDrafts()};}
+async function saveProject(forceName){
+  let name=forceName||document.querySelector('[data-project-name]')?.value.trim();
+  if(!name)name=await pcmPrompt('请输入项目名称',state.oldName&&state.newName?state.oldName+' / '+state.newName:'预设编辑项目');
+  if(!name)return;
+  try{
+    const data=projectData(name,state.projectId);
+    await writeProject(data);
+    state.projectId=data.id;
+  }catch(error){pcmToastr.error('项目保存失败：'+error.message);return;}
+  await refreshProjects();pcmToastr.success('项目已保存');
+}
+async function loadProject(id){
+  let data;
+  try{data=await readProject(id);}catch(error){pcmToastr.error('项目加载失败：'+error.message);return;}
+  if(!data){pcmToastr.warning('此项目已不存在');await refreshProjects();return;}
+  state.old=data.old;state.new=data.new;resetImportedGroups('old');resetImportedGroups('new');state.oldName=data.oldName||'';state.newName=data.newName||'';state.dragged={old:new Set(data.dragged?.old||[]),new:new Set(data.dragged?.new||[])};state.modified={old:new Set(data.modified?.old||[]),new:new Set(data.modified?.new||[])};state.filter=data.filter||{old:'all',new:'all'};state.projectId=data.id;restoreFormDrafts(data);state.history=[];updateUndoButton();state.activeId=null;state.activeSide=null;hideCompare();rebuildCache();renderAll(false);await refreshProjects();}
+async function deleteProject(id){
+  if(!(await pcmConfirm('确定删除这个已保存项目吗？')))return;
+  try{await removeProject(id);}catch(error){pcmToastr.error('项目删除失败：'+error.message);return;}
+  if(state.projectId===id)state.projectId=null;
+  if(selectedProjectId===id)selectedProjectId=null;
+  await refreshProjects();
+}
+async function refreshProjects(){let projects;try{projects=await listProjects();}catch{return;}const select=document.querySelector('[data-project-select]');if(select){select.replaceChildren();const empty=el('option','',projects.length?'选择已保存项目':'暂无已保存项目');empty.value='';select.append(empty);for(const project of projects){const option=el('option','',project.name+' · '+new Date(project.updatedAt).toLocaleString());option.value=project.id;option.selected=project.id===state.projectId;select.append(option);}}const dropList=document.querySelector('[data-proj-list]');if(dropList&&dropList.closest('.pcm-proj-drop')?.classList.contains('open'))refreshProjList(projects);const current=projects.find(x=>x.id===state.projectId),name=document.querySelector('[data-project-name]');if(name&&current){name.value=current.name;selectedProjectId=current.id;}}
+function pushUndo(action){state.history.push(action);if(state.history.length>50)state.history.shift();updateUndoButton();}
+function discardSideUndo(side){state.history=state.history.filter(action=>action.side!==side);updateUndoButton();}
+function updateUndoButton(){document.querySelectorAll('[data-action=undo]').forEach(button=>{button.disabled=!state.history.length;});}
+function undoLast(){const pending=state.history.at(-1);if(pending?.tempLibrary){if(state[pending.side]!==pending.preset){state.history.pop();updateUndoButton();pcmToastr.warning('预设已切换，该步临时库插入不能在当前预设中撤回');return;}if(isSideSavePending(pending.side)){pcmToastr.warning('正在保存预设，请稍后撤回');return;}}if(state.history.at(-1)?.type==='text-replace'){const action=state.history.at(-1);if(!undoTextReplacement(action))return;state.history.pop();state.activeId=null;state.activeSide=null;hideCompare();rebuildCache();renderAll();updateUndoButton();return;}const action=state.history.pop();if(!action)return;const side=action.side,preset=state[side];if(action.type==='preset-group-toggle'){const group=getBaiBaiGroupState(preset)?.groups?.find(g=>String(g.id)===action.groupId);if(group){if(action.hadEnabled)group.enabled=action.beforeEnabled;else delete group.enabled;}}else if(action.type==='stitch'||action.type==='migration'){state[side]=action.before;state.modified[side]=new Set(action.modifiedBefore);state.dragged[side]=new Set(action.draggedBefore);}else if(action.type==='edit'){const index=preset.prompts.findIndex(p=>p.identifier===action.id);if(index>=0)preset.prompts[index]=action.before;state.modified[side]=new Set(action.modifiedBefore);}else if(action.type==='variables'){preset.prompts=action.prompts;state.modified[side]=new Set(action.modifiedBefore);}else if(action.type==='move'){preset.prompts=action.promptOrder.map(id=>action.prompts.get(id)).filter(Boolean);preset.prompt_order=clone(action.promptOrderData);preset.extensions=action.tempLibrary?action.extensionsBefore:clone(action.extensionsBefore);state.dragged[side]=new Set(action.draggedBefore);}else if(action.type==='regex'){if(action.beforeExtensions===undefined)delete preset.extensions;else preset.extensions=clone(action.beforeExtensions);}state.dirty[side]=action.tempLibrary&&preset===action.preset&&getTextReplaceLineage(preset).savedRevision===action.savedRevision&&JSON.stringify(preset)===action.beforeSignature?action.dirtyBefore:action.type==='stitch'?action.dirtyBefore:action.type==='migration'&&preset===action.after&&getTextReplaceLineage(preset).savedRevision===action.savedRevision?action.dirtyBefore:action.type==='preset-group-toggle'&&preset===action.preset&&getTextReplaceLineage(preset).savedRevision===action.savedRevision&&JSON.stringify(state[side])===action.beforeSignature?action.dirtyBefore:true;state.activeId=null;hideCompare();rebuildCache();renderAll();updateUndoButton();}
+
+function el(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=String(text);return n;}
+function btn(text,action,cls,side){const n=el('button','menu_button '+(cls||''),text);n.type='button';n.dataset.action=action;if(side)n.dataset.side=side;return n;}
+/* 轻量提示：替代酒馆 toastr（其 CSS 动画/全局容器在移动端较卡），在对话框底部短暂浮现后自动消失。 */
+let pcmToastBox=null;
+function pcmToast(text,type='info',title){let box=pcmToastBox;if(!box||!box.isConnected)box=pcmToastBox=el('div','pcm-toastbox');const container=document.getElementById(APP_ID+'-dialog')||document.body;if(box.parentNode!==container)container.append(box);const item=el('div','pcm-toast pcm-toast-'+type,(title?title+'：':'')+text);if(type==='error')item.append(createDiagnosticsAction({host,toast:pcmToast}));box.append(item);requestAnimationFrame(()=>item.classList.add('in'));const ms=type==='error'?6000:3000;setTimeout(()=>{item.classList.remove('in');setTimeout(()=>item.remove(),260);},ms);}
+const pcmToastr={success:(t,ti)=>pcmToast(t,'success',ti),info:(t,ti)=>pcmToast(t,'info',ti),warning:(t,ti)=>pcmToast(t,'warning',ti),error:(t,ti)=>pcmToast(t,'error',ti)};
+function rebuildCache(){for(const side of ['old','new']){const preset=state[side],map=new Map((preset?.prompts||[]).map(p=>[p.identifier,p]));state.cache.maps[side]=map;const seen=new Set(),out=[],orderEntry=promptOrderEntry(preset),orderEntries=Array.isArray(orderEntry?.order)?orderEntry.order:[];for(const item of orderEntries){const id=typeof item==='string'?item:item?.identifier,p=map.get(id);if(p&&!seen.has(id)){seen.add(id);out.push(p);}}for(const p of preset?.prompts||[])if(!seen.has(p.identifier)){seen.add(p.identifier);out.push(p);}state.cache.ordered[side]=out;}rebuildComparisonCache();}
+function rebuildComparisonCache(){
+  const prev=state.cache.comparisonContext;
+  const reuse=prev?.old===state.old&&prev?.new===state.new&&prev?.loose===state.ignoreWhitespace;
+  state.cache.pairs=comparePromptPairs(state.old,state.new,{ignoreWhitespace:state.ignoreWhitespace,previous:reuse?state.cache.pairs:null,edited:state.modified});
+  state.cache.comparisonContext={old:state.old,new:state.new,loose:state.ignoreWhitespace};
+  state.cache.similarity.clear();
+}
+function pairFor(id,side=state.activeSide){return state.cache.pairs?.[side]?.get(id);}
+function comparisonPrompts(id,side=state.activeSide){const pair=pairFor(id,side);return{old:byId('old').get(pair?.oldId),new:byId('new').get(pair?.newId)};}
+function counterpartId(side,id){return pairFor(id,side)?.[side==='old'?'newId':'oldId']??null;}
+function isComparisonActive(side,id){if(tempLibrarySide)return side===tempLibrarySide&&state.activeSide===side&&state.activeId===id;return !!state.activeId&&pairFor(state.activeId)?.[side+'Id']===id;}
+function comparisonHint(id,side=state.activeSide){const p=pairFor(id,side);if(p?.status==='uncertain')return '缺少能确定唯一对应条目的依据，可用「自由选择」查看';if(!p?.oldId||!p.newId||p.oldId===p.newId)return '';return p.kind==='heading'?'按标题与相邻条目匹配（ID 不同）':p.kind==='similar'?'按相似正文匹配（ID 不同，请核对差异）':p.kind==='name-text'?'按完整名称与相似正文匹配（ID 不同）':p.kind==='context'?'按完整名称与预设结构匹配（ID 不同）':'按正文匹配（ID 不同）';}
+// 索引仅在本次同步渲染内使用；编辑、撤回和拖拽后不会读到跨轮缓存。
+const listOrderIndex={old:null,new:null};
+function withListOrderIndex(side,run){const previous=listOrderIndex[side];listOrderIndex[side]=indexPromptOrder(promptOrderEntry(state[side])?.order);try{return run();}finally{listOrderIndex[side]=previous;}}
+function promptEnabled(side,prompt){if(listOrderIndex[side])return indexedPromptEnabled(listOrderIndex[side],prompt);const item=promptOrderEntry(state[side])?.order?.find(x=>(typeof x==='string'?x:x?.identifier)===prompt.identifier);return typeof item==='object'&&typeof item.enabled==='boolean'?item.enabled:prompt.enabled!==false;}
+function updateEnabledRowVisual(side,id){if(!["all","dragged","modified"].includes(state.filter[side])){renderList(side);return;}const list=document.querySelector('[data-list="'+side+'"]'),row=rowById(list,id);if(!row){renderList(side);return;}const prompt=byId(side).get(id),enabled=prompt?promptEnabled(side,prompt):true;row.classList.toggle('pcm-row-disabled',!enabled);const sw=row.querySelector('.pcm-switch');if(sw){sw.classList.toggle('pcm-op-enabled',enabled);sw.classList.toggle('pcm-op-disabled',!enabled);sw.setAttribute('aria-checked',String(enabled));sw.title=enabled?'已启用':'已禁用';}const otherSide=side==='old'?'new':'old',otherId=counterpartId(side,id),otherRow=rowById(document.querySelector('[data-list="'+otherSide+'"]'),otherId);updateRowBadge(row,id,side);updateRowBadge(otherRow,otherId,otherSide);updateSummary(side);updateSummary(otherSide);}
+function togglePromptEnabled(side,id){const prompt=byId(side).get(id);if(!prompt)return;const next=!promptEnabled(side,prompt),entry=promptOrderEntry(state[side]);if(entry){let item=entry.order.find(x=>(typeof x==='string'?x:x?.identifier)===id);if(typeof item==='string'){const index=entry.order.indexOf(item);item={identifier:id,enabled:next};entry.order[index]=item;}else if(item)item.enabled=next;else entry.order.push({identifier:id,enabled:next});}prompt.enabled=next;state.dirty[side]=true;rebuildCache();updateEnabledRowVisual(side,id);if(isComparisonActive(side,id))renderCompare();}
+function bindEnabledTags(side){document.querySelectorAll('[data-list="'+side+'"] .pcm-op-enabled,[data-list="'+side+'"] .pcm-op-disabled').forEach(tag=>{const row=tag.closest('.pcm-row');if(row){tag.dataset.toggleEnabled=row.dataset.dragId;tag.dataset.side=side;tag.title='Toggle enabled state';}});}
+function isInjected(side,prompt){if(listOrderIndex[side])return indexedPromptInjected(listOrderIndex[side],prompt);const entry=promptOrderEntry(state[side]);if(!entry?.order?.length)return true;return entry.order.some(x=>(typeof x==='string'?x:x?.identifier)===prompt.identifier);}
+function unInjected(side){return(state[side]?.prompts||[]).filter(p=>!isInjected(side,p));}
+function appendUnInjectedGroup(side,list,used){const prompts=unInjected(side);if(!prompts.length)return;const collapsed=state.unInjectedCollapsed[side]!==false,group=el('section','pcm-group pcm-uninjected'+(collapsed?' pcm-collapsed':'')),head=el('button','pcm-group-head pcm-uninjected-toggle'),body=el('div','pcm-group-body');head.type='button';head.dataset.action='toggle-uninjected';head.dataset.side=side;head.setAttribute('aria-expanded',String(!collapsed));head.append(el('span','pcm-group-caret',collapsed?'\u25b6':'\u25bc'),el('span','', '未注入'),el('small','',prompts.length+' 条'));body.hidden=collapsed;for(const prompt of prompts)body.append(rowFor(side,prompt,used));group.append(head,body);list.append(group);}
+function applyUiTheme(){const d=document.getElementById(APP_ID+'-dialog');if(!d)return;d.classList.toggle('pcm-theme-day',state.uiTheme==='day');d.classList.toggle('pcm-theme-night',state.uiTheme==='night');}
+function cycleUiTheme(){const i=UI_THEMES.findIndex(x=>x[0]===state.uiTheme);state.uiTheme=UI_THEMES[(i+1)%UI_THEMES.length][0];saveUiTheme(state.uiTheme);applyUiTheme();document.querySelectorAll('[data-theme-toggle]').forEach(b=>{b.innerHTML=UI_THEME_ICONS[state.uiTheme]||'';});}
+function installHeaderToggles(){const header=document.querySelector('.pcm-header'),windowActions=header?.querySelector('.pcm-window-actions'),toggles=header?.querySelector('.pcm-header-toggles');if(!header||!windowActions||!toggles)return;if(!header.querySelector('[data-theme-toggle]')){const tbtn=el('button','menu_button pcm-theme-toggle');tbtn.type='button';tbtn.dataset.themeToggle='';tbtn.innerHTML=UI_THEME_ICONS[state.uiTheme]||'';tbtn.title='切换插件配色：叶子=自适应酒馆 / 太阳=日间 / 月亮=夜间（Gruvbox Dark），选择会自动记住';tbtn.addEventListener('click',cycleUiTheme);windowActions.prepend(tbtn);}const addToggle=(dataKey,text,checked,title='')=>{const label=el('label','pcm-free-select'),input=el('input');input.type='checkbox';input.dataset[dataKey]='';input.checked=checked;if(title)label.title=title;label.append(input,el('span','',text));toggles.append(label);};if(!header.querySelector('[data-free-select]'))addToggle('freeSelect','自由选择',state.freeSelect.enabled);if(!header.querySelector('[data-ignore-whitespace]'))addToggle('ignoreWhitespace','忽略空白',state.ignoreWhitespace,'忽略仅空白（空格/换行/缩进）不同的差异');if(!header.querySelector('[data-show-similarity]'))addToggle('showSimilarity','差异程度',state.showSimilarity,'同名已修改条目显示正文差异百分比，差异小可放心忽略、差异大重点核对是否为自己的魔改或作者的重要更新');if(!header.querySelector('[data-sync-scroll]'))addToggle('syncScroll','同步滚动',state.syncScroll,'开启后左右两个列表按渲染顺序对齐滚动，便于逐条对比同一条目');if(!header.querySelector('[data-multi-select]'))addToggle('multiSelect','多选',state.multiSelect.enabled,'开启后点击条目即可选中/取消，选中多条后可一起拖拽到另一版本指定位置或分组');if(!header.querySelector('[data-action="manage-regex"]')){const regex=btn('正则','manage-regex','pcm-header-regex');regex.title='打开新旧预设正则对比：支持点击迁移、拖拽跨版本以及 BaiBai 正则分组';toggles.append(regex);}}
+/* 全文档 subtree 观察已移除（酒馆流式消息每次 DOM 变动都会触发，拖累宿主页面）：shell() 挂载后直接调 installHeaderToggles()。 */
+function onHeaderToggleChange(event){if(event.target.matches?.('[data-free-select]'))setFreeSelect(event.target.checked);if(event.target.matches?.('[data-ignore-whitespace]'))setIgnoreWhitespace(event.target.checked);if(event.target.matches?.('[data-show-similarity]'))setShowSimilarity(event.target.checked);if(event.target.matches?.('[data-sync-scroll]'))setSyncScroll(event.target.checked);if(event.target.matches?.('[data-multi-select]'))setMultiSelect(event.target.checked);}
+function onFreeSelectClick(event){if(singleSide||!state.freeSelect.enabled)return;const button=event.target.closest?.('[data-open][data-side]');if(tempLibrarySide){if(button?.dataset.side===tempLibrarySide){selectTempLibraryPrompt(button.dataset.open);event.preventDefault();event.stopImmediatePropagation();}return;}if(button&&selectFreePrompt(button.dataset.side,button.dataset.open)){event.preventDefault();event.stopImmediatePropagation();}}
+function setMultiSelect(enabled){state.multiSelect.enabled=enabled;state.multiSelect.selected.old.clear();state.multiSelect.selected.new.clear();renderAll();pcmToastr.info(enabled?'多选已开启：点击条目选中/取消，选中多条后可整批拖拽到另一版本或分组':'多选已关闭');}
+function toggleMultiSelect(side,id){if(!state.multiSelect.enabled||!side||!id)return;const set=state.multiSelect.selected[side];if(!set)return;if(set.has(id))set.delete(id);else set.add(id);renderList(side);}
+function dragIdsFor(row){if(!row||!state.multiSelect.enabled)return null;const side=row.dataset.dragSide,id=row.dataset.dragId;if(!side||!id||!state.multiSelect.selected[side]?.has(id))return null;const orderedIds=ordered(side).map(p=>p.identifier).filter(x=>state.multiSelect.selected[side].has(x));return orderedIds.length>1?{ids:orderedIds,side}:null;}
+function moveSnapshot(side){const preset=state[side];return{type:'move',side,promptOrder:preset.prompts.map(p=>p.identifier),prompts:new Map(preset.prompts.map(p=>[p.identifier,p])),promptOrderData:clone(preset.prompt_order),extensionsBefore:clone(preset.extensions),draggedBefore:[...state.dragged[side]]};}
+// 一次拖入先按两侧原始列表规划，避免前一条改变后一条的覆盖候选。
+function planDroppedPrompts(sourceSide,targetSide,ids){return sourceSide===targetSide?null:planPromptDrops(state[sourceSide],state[targetSide],ids,{overwriteSameIdOnDrop:editorPreferences.overwriteSameIdOnDrop,counterpartId:id=>counterpartId(sourceSide,id)});}
+function notifyDroppedPrompts(plan,message){const ambiguous=[...(plan?.values()||[])].filter(item=>item.reason);if(ambiguous.length)pcmToastr.warning(ambiguous.length+' 个条目匹配存在歧义，已创建编号副本，原条目保留');else pcmToastr.success(message);}
+function movePrompts(sourceSide,targetSide,ids,beforeId){
+  const moved=new Map(),validIds=[...new Set(ids)].filter(id=>byId(sourceSide).has(id));
+  if(!state[targetSide]||!validIds.length)return moved;
+  const plan=planDroppedPrompts(sourceSide,targetSide,validIds);
+  // 落点若也在本批移动／覆盖中，先固定到其后第一个未移动的目标；使用规划后的目标 ID，副本不排除原条目。
+  const movingIds=new Set(validIds.map(id=>plan?.get(id)?.prompt.identifier??id));
+  if(movingIds.has(beforeId)){
+    const ordered=state.cache.ordered[targetSide],index=ordered.findIndex(p=>p.identifier===beforeId);
+    if(index>=0)beforeId=ordered.slice(index+1).find(p=>!movingIds.has(p.identifier))?.identifier??null;
+  }
+  pushUndo(moveSnapshot(targetSide));
+  for(const id of validIds){const targetId=movePrompt(sourceSide,targetSide,id,beforeId,true,true,plan?.get(id));if(targetId)moved.set(id,targetId);}
+  notifyDroppedPrompts(plan,'已批量放置 '+moved.size+' 个条目');return moved;
+}
+// 指针、触摸和 HTML5 行落点统一使用最终 ID，避免副本入组时修改原同 ID 条目的归属。
+function placeDroppedPrompts(sourceSide,targetSide,ids,beforeId,groupId){
+  const moved=ids.length>1?movePrompts(sourceSide,targetSide,ids,beforeId):new Map();
+  if(ids.length===1){const targetId=movePrompt(sourceSide,targetSide,ids[0],beforeId);if(targetId)moved.set(ids[0],targetId);}
+  if(groupId!==undefined){for(const targetId of moved.values())applyDropGroup(targetSide,targetId,groupId);rebuildCache();renderList(targetSide);}
+  return moved;
+}
+function setFreeSelect(enabled){if(tempLibrarySide){state.freeSelect.enabled=enabled;resetTempLibrarySelection();}else state.freeSelect={enabled,oldId:null,newId:null};state.activeId=null;state.activeSide=null;const toggle=document.querySelector('[data-free-select]');if(toggle)toggle.checked=enabled;saveUiPrefs();hideCompare();renderAll();pcmToastr.info(enabled?(tempLibrarySide?'选择一个预设条目与一个临时库条目进行对比':'请先选择旧版条目，再选择新版条目'):'已关闭自由选择');}
+function setIgnoreWhitespace(enabled){state.ignoreWhitespace=enabled;saveUiPrefs();rebuildCache();renderAll();pcmToastr.info(enabled?'已忽略仅空白（空格/换行/缩进）不同的差异':'已恢复逐字精确比对');}
+function setShowSimilarity(enabled){state.showSimilarity=enabled;saveUiPrefs();renderAll();pcmToastr.info(enabled?'已显示同名条目正文差异百分比':'已隐藏差异百分比');}
+function setSyncScroll(enabled){state.syncScroll=enabled;saveUiPrefs();pcmToastr.info(enabled?(matchMedia('(max-width:900px)').matches?'已开启同步滚动：左右列表按渲染序位对齐（竖排布局下仅位置联动）':'已开启同步滚动：左右列表按渲染序位对齐'):'已关闭同步滚动');}
+/* 同步滚动(v1.6.2)：开启后左右列表按 prompt_order 渲染顺序对齐滚动。取源列表视口中心行为锚点，
+   换算成其渲染顺序(filtered)中的序位，目标列表滚到同序位条目行(不要求同 id，两侧排序保持一致即可联动)；
+   rAF 节流 + guard 吞掉对侧回写触发的事件防死循环；锚点是未注入行/目标序位缺失时静默跳过；面板销毁随 dialog 一起释放。 */
+let syncScrollRaf=0,syncScrollGuard=false,syncScrollPair=null;function installSyncScroll(){for(const side of['old','new']){const list=document.querySelector('[data-list="'+side+'"]');if(list&&!list.dataset.syncBound){list.dataset.syncBound='1';list.addEventListener('scroll',onListScroll,{passive:true});}}}function onListScroll(event){if(singleSide||tempLibrarySide||!state.syncScroll)return;const src=event.currentTarget;if(syncScrollGuard){syncScrollGuard=false;return;}const srcSide=src.dataset.list,otherSide=srcSide==='old'?'new':'old';const other=document.querySelector('[data-list="'+otherSide+'"]');if(!other)return;const r=src.getBoundingClientRect();if(!(r.width>0&&r.height>0))return;let anchor=null;try{const hit=document.elementFromPoint(r.left+Math.min(48,r.width/2),r.top+r.height/2);if(hit){anchor=hit.closest?.('.pcm-row')||null;if(anchor&&anchor.closest('[data-list]')!==src)anchor=null;}}catch{}if(!anchor)return;/* 按渲染顺序(prompt_order+过滤结果)对齐:源列表序位 → 目标列表同序位 */const srcList=filtered(srcSide),idx=srcList.findIndex(p=>p.identifier===anchor.dataset.dragId);if(idx<0)return;const otherList=filtered(otherSide);if(!otherList.length)return;const targetId=otherList[Math.min(idx,otherList.length-1)].identifier;syncScrollPair={other,id:targetId,offset:anchor.getBoundingClientRect().top-r.top};if(!syncScrollRaf)syncScrollRaf=requestAnimationFrame(applySyncScroll);}function applySyncScroll(){syncScrollRaf=0;if(singleSide||tempLibrarySide||!state.syncScroll)return;const p=syncScrollPair;syncScrollPair=null;if(!p)return;const target=p.other.querySelector('.pcm-row[data-drag-id="'+CSS.escape(p.id)+'"]');if(!target||!target.isConnected)return;const want=p.other.getBoundingClientRect().top+p.offset;syncScrollGuard=true;p.other.scrollTop+=target.getBoundingClientRect().top-want;}
+function selectFreePrompt(side,id){if(!state.freeSelect.enabled)return false;if(side==='old'&&state.freeSelect.oldId===id){/* 再次点击已选中的旧版条目=取消选中(连带取消新版) */state.freeSelect.oldId=null;state.freeSelect.newId=null;markFreeSelection();hideCompare();pcmToastr.info('已取消选择旧版条目');return true;}if(side==='new'&&state.freeSelect.newId===id){/* 再次点击已选中的新版条目=取消选中新版 */state.freeSelect.newId=null;markFreeSelection();hideCompare();pcmToastr.info('已取消选择新版条目');return true;}if(!state.freeSelect.oldId){if(side!=='old'){pcmToastr.warning('请先选择旧版条目');return true;}state.freeSelect.oldId=id;markFreeSelection();pcmToastr.info('已选择旧版条目，请选择新版条目');return true;}if(side==='old'){state.freeSelect.oldId=id;state.freeSelect.newId=null;markFreeSelection();hideCompare();pcmToastr.info('已更换旧版条目，请选择新版条目');return true;}state.freeSelect.newId=id;markFreeSelection();renderFreeCompare(true);return true;}
+function markFreeSelection(){for(const side of ['old','new']){const id=tempLibrarySide?(side===tempLibrarySide?state.activeId:null):state.freeSelect[side+'Id'];document.querySelectorAll('[data-list="'+side+'"] .pcm-row').forEach(row=>{const expect=state.freeSelect.enabled&&row.dataset.dragId===id;row.classList.toggle('pcm-free-selected',expect);if(row.classList.contains('pcm-free-selected')!==expect)state.cache.rows[side].delete(row.dataset.dragId);});}}
+function markEnabledTag(row,side,id){const tag=row?.querySelector('.pcm-operation-tags .pcm-op-enabled,.pcm-operation-tags .pcm-op-disabled');if(tag){tag.dataset.toggleEnabled=id;tag.dataset.side=side;tag.title='Toggle enabled state';}}
+function byId(side){return state.cache.maps[side];}
+/* 同名条目正文差异度（相似度）：仅比对正文 content，Dice 系数(字符 bigram 集合) 0~1，供「差异 x%」徽章。
+   尊重「忽略空白」开关（开启时先剥掉所有空白再算）；缓存于 state.cache.similarity，rebuildCache 时仅对 changed 条目惰性计算。 */
+function contentSimilarity(a,b){return calculateContentSimilarity(a,b,state.ignoreWhitespace);}
+function similarityOf(id,side){const key=pairFor(id,side),c=state.cache.similarity;if(c.has(key))return c.get(key);const {old:o,new:n}=comparisonPrompts(id,side);if(!o||!n)return null;const v=contentSimilarity(o.content,n.content);c.set(key,v);return v;}
+function badgeText(id,side){const status=statusOf(id,side);if(status==='changed'&&state.showSimilarity){const sim=similarityOf(id,side);if(sim!==null&&sim!==undefined){const {old:o,new:n}=comparisonPrompts(id,side);const norm=t=>state.ignoreWhitespace?String(t||'').replace(/\s+/g,''):String(t||''),ol=norm(o&&o.content).length,nl=norm(n&&n.content).length,pct=Math.round(Math.abs(nl-ol)/(Math.max(ol,nl)||1)*100);if(pct>0){const less=(side==='old')===(nl>ol);return(less?'少 ':'多 ')+pct+'%';}return '差异 '+Math.round((1-sim)*100)+'%';}}return statusText[status];}
+function statusOf(id,side=state.activeSide){return pairFor(id,side)?.status||'same';}
+const statusText={uncertain:'未确定对应',removed:'新版已删除',added:'新版新增',changed:'内容已修改',same:'内容相同'};
+function ordered(side){const preset=state[side],entry=promptOrderEntry(preset),map=state.cache.maps[side];if(entry&&preset.prompt_order?.[0]!==entry){const index=preset.prompt_order.indexOf(entry);preset.prompt_order.splice(index,1);preset.prompt_order.unshift(entry);}if(entry?.order?.length){const out=[],seen=new Set();for(const item of entry.order){const id=typeof item==='string'?item:item?.identifier,p=map?.get(id);if(p&&!seen.has(id)){seen.add(id);out.push(p);}}for(const p of preset?.prompts||[])if(!seen.has(p.identifier)){seen.add(p.identifier);out.push(p);}state.cache.ordered[side]=out;return out;}const out=(preset?.prompts||[]).slice();state.cache.ordered[side]=out;return out;}
+let singleSide=null;
+const singleFilters={old:'all',new:'all'},dualFilters={old:'all',new:'all'},inlineDrafts=new WeakMap();
+// 查找替换只改当前侧草稿；表单未提交的文字参与预览，其他字段继续保留在表单中。
+const textReplacePanels=new Map(),textReplaceLineages=new WeakMap();
+let presetCheckPanel=null;
+function closePresetCheck(){presetCheckPanel?.dispose();presetCheckPanel?.element.remove();presetCheckPanel=null;}
+function getCheckSnapshot(side,generationType='normal',currentId=null){
+  const preset=state[side];if(!preset)throw Error('请先载入这一侧预设');
+  const drafts=new Map(preset.prompts.flatMap(p=>inlineDrafts.has(p)?[[p.identifier,inlineDrafts.get(p)]]:[]));
+  for(const form of document.querySelectorAll('.pcm-inline-form[data-side="'+side+'"]'))drafts.set(form.dataset.id,Object.fromEntries(new FormData(form)));
+  let context;
+  if(currentId){const p=preset.prompts.find(p=>p.identifier===currentId);if(!p)throw Error('条目已不存在');const draft=drafts.get(currentId);context={entries:[{id:currentId,name:draft?.name??p.name,text:draft?.content??p.content??''}],streams:[],uncertainties:[]};}
+  else context=collectCheckContext(preset,{drafts,generationType});
+  return {presetIdentity:preset,revision:JSON.stringify([preset,[...drafts],generationType,currentId]),context};
+}
+function openCheck(side,currentId=null){
+  try{closePresetCheck();
+    presetCheckPanel=openPresetCheckPanel({dialog:document.getElementById(APP_ID+'-dialog'),title:(currentId?'符号检查':'结构检查')+' · '+(side==='old'?'旧版':'新版'),single:!!currentId,
+      getContext:type=>getCheckSnapshot(side,type,currentId),runCheck:snapshot=>currentId?checkEntrySymbols(snapshot.context.entries[0]):checkPresetStructure(snapshot.context,{}),
+      navigate(issue){
+        if(!byId(side).has(issue.entryId))throw Error('条目已不存在，请重新检查');
+        state.activeId=issue.entryId;state.activeSide=side;
+        if(state.freeSelect.enabled&&!tempLibrarySide){state.freeSelect[side+'Id']=issue.entryId;}
+        for(const form of document.querySelectorAll('.pcm-inline-form')){const p=byId(form.dataset.side).get(form.dataset.id);if(p)rememberInlineDraft(p,form,form.dataset.side);}
+        if(tempLibrarySide)renderTempLibraryDetail(true,true);else if(singleSide)renderSingleDetail(true);else if(state.freeSelect.enabled){renderFreeCompare(true);if(!document.querySelector('.pcm-inline-form[data-side="'+side+'"][data-id="'+CSS.escape(issue.entryId)+'"]'))renderCompare(true);}else renderCompare(true);
+        const detail=document.querySelector('[data-compare]'),form=[...detail.querySelectorAll('.pcm-inline-form')].find(f=>f.dataset.side===side&&f.dataset.id===issue.entryId),area=form?.querySelector('textarea[name=content]');
+        if(area)requestAnimationFrame(()=>{area._pcmRandomEditor?.setEnabled(false);area.focus();area.setSelectionRange(issue.start,issue.end);const lines=area.value.slice(0,issue.start).split('\n').length-1;area.scrollTop=Math.max(0,lines*(parseFloat(getComputedStyle(area).lineHeight)||20)-area.clientHeight/3);area.dispatchEvent(new Event('scroll'));});
+        const list=document.querySelector('[data-list="'+side+'"]');for(const group of list?.querySelectorAll('.pcm-group')||[]){if(group._pcmPromptIds?.includes(issue.entryId)&&group.classList.contains('pcm-collapsed'))toggleRenderedGroup(side,group._pcmGroupKey);}
+      },onClose(){presetCheckPanel=null;}});
+  }catch(error){pcmToastr.warning(error.message);}
+}
+// 正文撤销记录按条目对象保存：关闭详情再打开仍可撤回未保存修改，保存条目后清空。
+const contentHistory=new WeakMap();
+function installDetailTools(detail){let slot=detail.querySelector('.pcm-compare-corner');if(!slot){const head=detail.querySelector('.pcm-compare-head');slot=el('div','pcm-undo-slot');head?.insertBefore(slot,head.querySelector('.pcm-collapse'));}
+  return installEntryTools(detail,{creatorEnabled:()=>editorPreferences.creatorMode,getEnvironment:()=>hostEnvironment,onEnvironment:onHostEnvironment,onCheckSymbols:openCheck,onError:message=>pcmToastr.warning(message),undoSlot:slot,history:{get:(side,id)=>contentHistory.get(byId(side).get(id)),set:(side,id,value)=>{const p=byId(side).get(id);if(p)contentHistory.set(p,value);}}});}
+// 条目警示只表示表单尚未提交；原位刷新以保留正文焦点、选区和随机编辑状态。
+const DRAFT_WARNING_SVG='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 22 21H2Z"/><path d="M12 9v5"/><circle cx="12" cy="17.5" r=".65" fill="currentColor" stroke="none"/></svg>';
+function showsDraftWarning(side,prompt){return !!state.showDraftMarkers[side]&&isPendingPromptDraft(prompt,inlineDrafts.get(prompt));}
+function syncDraftControls(){
+  for(const side of ['old','new']){const toggle=document.querySelector('[data-action=toggle-draft-markers][data-side="'+side+'"]');if(toggle){toggle.setAttribute('aria-pressed',String(state.showDraftMarkers[side]));toggle.disabled=!state[side];}}
+}
+function refreshDraftIndicators(side,id){
+  for(const [key,row] of state.cache.rows[side]){if(id&&id!==key)continue;const prompt=byId(side).get(key),warning=row.querySelector('.pcm-draft-warning');if(warning)warning.hidden=!prompt||!showsDraftWarning(side,prompt);row._k='';}
+}
+function rememberInlineDraft(prompt,form,side){
+  const draft=Object.fromEntries(new FormData(form));
+  if(isPendingPromptDraft(prompt,draft))inlineDrafts.set(prompt,draft);else inlineDrafts.delete(prompt);
+  refreshDraftIndicators(side,prompt.identifier);
+}
+// 双栏迁移入口与分组操作；沿用当前草稿，既有条目对象保持以保护WeakMap表单草稿。
+const GROUP_EDIT_ICON='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z"/></svg>';
+const GROUP_DELETE_ICON='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg>';
+let migrationDialog=null;
+function closeMigrationDialog(){migrationDialog?.close();migrationDialog=null;}
+function openAddedMigration(){
+ if(singleSide||tempLibrarySide||!state.old||!state.new)return;
+ if([...variablePanels.values()].some(({panel})=>panel.hasDraft?.())){pcmToastr.warning('变量面板有未提交内容，请先保存或放弃表单，再迁移');return;}
+ if(isSideSavePending('old')||isSideSavePending('new')){pcmToastr.warning('预设正在保存，请等待保存完成后再迁移');return;}
+ closeMigrationDialog();
+ const oldPreset=state.old,newPreset=state.new,ignoreWhitespace=state.ignoreWhitespace;
+ const source=buildPresetDraftSnapshot(oldPreset,inlineDrafts),target=clone(newPreset),targetPreview=buildPresetDraftSnapshot(newPreset,inlineDrafts);
+ const baseline=JSON.stringify([oldPreset,newPreset,source,targetPreview,state.oldName,state.newName,state.tavernSource,ignoreWhitespace,captureFormDrafts()]);
+ const isCurrent=()=>!singleSide&&!tempLibrarySide&&![...variablePanels.values()].some(({panel})=>panel.hasDraft?.())&&!isSideSavePending('old')&&!isSideSavePending('new')&&state.old===oldPreset&&state.new===newPreset&&baseline===JSON.stringify([state.old,state.new,buildPresetDraftSnapshot(state.old,inlineDrafts),buildPresetDraftSnapshot(state.new,inlineDrafts),state.oldName,state.newName,state.tavernSource,state.ignoreWhitespace,captureFormDrafts()]);
+ migrationDialog=openMigrationDialog({parent:document.getElementById(APP_ID+'-dialog'),source,target,targetPreview,sourceName:state.oldName,targetName:state.newName,ignoreWhitespace,isCurrent,onClose:()=>{migrationDialog=null;},onApply:plan=>{
+  if(!isCurrent())throw Error('预设或编辑内容已变化，请关闭窗口后重新分析');
+  const next=applyMigration(source,target,plan),existing=new Map(newPreset.prompts.map(p=>[p.identifier,p]));
+  next.prompts=next.prompts.map(p=>{
+    const original=existing.get(p.identifier);if(!original)return p;
+    if(original.enabled===p.enabled)return original;
+    // Only a manually toggled un-injected row changes prompt.enabled. Preserve its unsaved form.
+    if(inlineDrafts.has(original))inlineDrafts.set(p,inlineDrafts.get(original));
+    return p;
+  });
+  if(Array.isArray(newPreset.extensions?.regex_scripts))next.extensions.regex_scripts=newPreset.extensions.regex_scripts;
+  const variables=variablePanels.get('new');if(variables){variables.panel.destroy();variablePanels.delete('new');if(variablePanel===variables.panel)variablePanel=null;}
+  pushUndo({type:'migration',side:'new',before:newPreset,after:next,savedRevision:getTextReplaceLineage(newPreset).savedRevision,dirtyBefore:state.dirty.new,modifiedBefore:[...state.modified.new],draggedBefore:[...state.dragged.new]});
+  textReplaceLineages.set(next,getTextReplaceLineage(newPreset));state.new=next;state.dirty.new=true;
+  for(const entry of plan.entries)state.dragged.new.add(entry.id);
+  state.activeId=null;state.activeSide=null;hideCompare();rebuildCache();renderAll();
+  pcmToastr.success(`新版草稿：迁入 ${plan.entries.length} 条，调整 ${plan.switchCount||0} 个开关，可整批撤回`);return true;
+ }});
+}
+function appendPresetGroupActions(actions,section,group,side){
+ const enabled=group.enabled!==false;section.classList.toggle('pcm-group-power-off',!enabled);
+ const power=btn('','toggle-preset-group','pcm-group-gate',side);power.dataset.groupId=String(group.id);power.setAttribute('role','switch');power.setAttribute('aria-checked',String(enabled));power.setAttribute('aria-label',(enabled?'关闭':'开启')+'分组供电：'+(group.name||'未命名分组'));power.title=(enabled?'分组供电已开启':'分组供电已关闭')+'；不改变组内条目开关，保存预设后生效';
+ const track=el('span','pcm-group-power-track');track.append(el('span','pcm-group-power-knob'));power.append(track);
+ const edit=iconBtn('rename-group','重命名分组',GROUP_EDIT_ICON,'pcm-group-icon'),remove=iconBtn('delete-group','删除分组',GROUP_DELETE_ICON,'pcm-group-icon');edit.dataset.side=side;remove.dataset.side=side;actions.append(power,edit,remove);
+}
+function togglePresetGroupPower(side,groupId){
+ const preset=state[side],group=getBaiBaiGroupState(preset)?.groups?.find(g=>String(g.id)===groupId);if(!group)return;
+ try{const next=setPresetGroupEnabled(preset,groupId,group.enabled===false);
+  pushUndo({type:'preset-group-toggle',side,groupId,preset,savedRevision:getTextReplaceLineage(preset).savedRevision,hadEnabled:Object.hasOwn(group,'enabled'),beforeEnabled:group.enabled,beforeSignature:JSON.stringify(preset),dirtyBefore:state.dirty[side]});
+  preset.extensions=next.extensions;state.dirty[side]=true;renderList(side);
+ }catch(error){pcmToastr.error(error.message);}
+}
+function setSummaryText(summary,text,side){
+  let label=summary.querySelector('.pcm-summary-text');if(!label){label=el('span','pcm-summary-text');summary.replaceChildren(label);}
+  label.textContent=text;let check=summary.querySelector('[data-action=check-preset]');
+  if(!check){check=btn('检查','check-preset','pcm-check-launch',side);check.setAttribute('aria-label','结构检查');check.title='检查当前侧启用预设的标签、宏与符号';summary.append(check);}
+  check.disabled=!state[side];
+  let warning=summary.querySelector('[data-action=toggle-draft-markers]');if(!warning){warning=btn('','toggle-draft-markers','pcm-draft-toggle',side);warning.innerHTML=DRAFT_WARNING_SVG;warning.setAttribute('aria-label','显示条目未保存标记');warning.title='显示尚未在条目内保存的编辑；不表示结构错误';summary.insertBefore(warning,check);}
+  if(side==='old'){let migrate=summary.querySelector('[data-action=migrate-added]');if(!migrate){migrate=btn('一键迁移','migrate-added','pcm-migration-launch');migrate.title='迁移新增条目到新版';summary.insertBefore(migrate,warning);}migrate.hidden=!!(singleSide||tempLibrarySide);migrate.disabled=!state.old||!state.new;}
+  let library=summary.querySelector('[data-action=toggle-temp-library]');
+  if(!library){library=btn('临时库','toggle-temp-library','pcm-library-launch',side);library.title='打开临时库，拖入这一侧预设';summary.insertBefore(library,warning);}
+  library.textContent='临时库'+(tempLibrarySession.items.size?' ('+tempLibrarySession.items.size+')':'');library.disabled=!state[side];library.setAttribute('aria-pressed',String(tempLibrarySide===side));
+  syncDraftControls();
+}
+
+function getTextReplaceContext(side,currentId){
+  const preset=state[side];
+  if(!preset)throw Error('请先载入这一侧预设');
+  const entries=preset.prompts.map(prompt=>{
+    const draft=inlineDrafts.get(prompt);
+    return draft?{...prompt,name:draft.name??prompt.name,content:draft.content??prompt.content}:prompt;
+  });
+  const ids=new Set(entries.map(p=>p.identifier));
+  const selectedIds=[...state.multiSelect.selected[side]].filter(id=>ids.has(id));
+  const filteredIds=filtered(side).map(p=>p.identifier);
+  const meta=getBaiBaiGroupState(preset);
+  const groups=(meta?.groups||[]).map(group=>({id:String(group.id),name:group.name||'未命名分组',ids:entries.filter(p=>String(meta.prompts?.[p.identifier]?.groupId)===String(group.id)).map(p=>p.identifier)}));
+  const active=currentId??(!singleSide&&!tempLibrarySide&&state.freeSelect.enabled?state.freeSelect[side+'Id']:(singleSide||state.activeSide===side)?state.activeId:state.cache?.pairs?.[state.activeSide]?.get(state.activeId)?.[side+'Id']);
+  const drafts=preset.prompts.flatMap(p=>inlineDrafts.has(p)?[[p.identifier,inlineDrafts.get(p)]]:[]);
+  const orderedIds=(state.cache?.ordered?.[side]||entries).map(p=>p.identifier);
+  return {entries,presetName:state[side+'Name'],orderedIds,currentId:ids.has(active)?active:null,selectedIds,filteredIds,groups,
+    version:{preset,name:state[side+'Name'],source:state.tavernSource[side],signature:JSON.stringify([preset,drafts,selectedIds,filteredIds])}};
+}
+// 内部草稿变换继承同一会话；从文件或酒馆重新载入的对象自动获得新会话。
+function getTextReplaceLineage(preset){
+  if(!textReplaceLineages.has(preset))textReplaceLineages.set(preset,{savedRevision:0});
+  return textReplaceLineages.get(preset);
+}
+function closeTextReplace(side,focus=false){
+  const record=textReplacePanels.get(side);if(!record)return;
+  record.panel.dispose();record.panel.element.remove();textReplacePanels.delete(side);
+  record.pane.classList.remove('pcm-replacing');
+  document.querySelector('.pcm-app')?.classList.toggle('pcm-replace-open',textReplacePanels.size>0);
+  const toggle=record.pane.querySelector('[data-action=text-replace]');toggle?.setAttribute('aria-expanded','false');
+  if(focus)toggle?.focus();
+}
+function closeTextReplacePanels(){for(const side of [...textReplacePanels.keys()])closeTextReplace(side);}
+function applyTextReplacement(side,plan,keys,context,taskOptions={}){
+  const assertCurrent=()=>{
+    if(taskOptions.signal?.aborted)throw Error('查找替换任务已取消。');
+    const current=getTextReplaceContext(side,context.currentId),a=context.version,b=current.version;
+    if(a.preset!==b.preset||a.name!==b.name||a.source!==b.source||a.signature!==b.signature)throw Error('预设、筛选或未保存表单已变化，请重新预览后替换。');
+    if(variablePanels.get(side)?.panel.hasDraft?.())throw Error('这一侧变量面板还有未提交内容，请先保存或放弃该表单，再进行替换。');
+    return current;
+  };
+  const current=assertCurrent();
+  // 正则在后台核验；等待期间编辑、关闭或切换后，旧结果不能回写当前草稿。
+  const commit=result=>{
+  assertCurrent();
+  if(!result.changedIds.length)return {matchCount:0,entryCount:0};
+  const selected=new Set(keys??plan.matches.map(m=>m.key)),fields=new Map();
+  for(const match of plan.matches)if(selected.has(match.key)){if(!fields.has(match.id))fields.set(match.id,new Set());fields.get(match.id).add(match.field);}
+  const changed=new Set(result.changedIds),nextById=new Map(result.entries.map(p=>[p.identifier,p]));
+  const changes=[],preset=state[side];
+  const next=preset.prompts.map(prompt=>{
+    if(!changed.has(prompt.identifier))return prompt;
+    const draft=inlineDrafts.get(prompt),copy={...prompt},after=nextById.get(prompt.identifier);
+    const nextDraft=draft?{...draft}:null;
+    for(const field of fields.get(prompt.identifier)){copy[field]=after[field];if(nextDraft)nextDraft[field]=after[field];}
+    changes.push({id:prompt.identifier,fields:[...fields.get(prompt.identifier)],before:clone(prompt),after:clone(copy),draftBefore:draft?clone(draft):null,afterDraft:nextDraft?clone(nextDraft):null});
+    if(nextDraft)inlineDrafts.set(copy,nextDraft);
+    return copy;
+  });
+  const lineage=getTextReplaceLineage(preset);
+  pushUndo({type:'text-replace',side,lineage,savedRevision:lineage.savedRevision,beforeSignature:JSON.stringify(preset),changes,dirtyBefore:state.dirty[side],modifiedBefore:[...state.modified[side]]});
+  preset.prompts=next;state.dirty[side]=true;
+  for(const id of changed)state.modified[side].add(id);
+  const variables=variablePanels.get(side);if(variables){variables.panel.destroy();variablePanels.delete(side);if(variablePanel===variables.panel)variablePanel=null;}
+  rebuildCache();renderAll();
+  return {matchCount:result.replacementCount,entryCount:changed.size};
+  };
+  if(plan.regex===true)return runReplacementTask('apply',{entries:current.entries,plan,keys},taskOptions).then(commit);
+  return commit(applyReplacementPlan(current.entries,plan,keys));
+}
+function undoTextReplacement(action){
+  // 后续尚未提交的输入不在撤回栈内；先保留它们，避免旧快照覆盖新输入。
+  const preset=state[action.side];
+  if(!preset||getTextReplaceLineage(preset)!==action.lineage){pcmToastr.warning('这一侧预设已重新载入，不能把旧替换撤回到另一份预设。');return false;}
+  const byCurrent=new Map(preset.prompts.map(p=>[p.identifier,p]));
+  for(const change of action.changes){
+    const prompt=byCurrent.get(change.id),draft=prompt&&inlineDrafts.get(prompt);
+    if(!prompt||(draft&&!equalValues(draft,change.afterDraft))||change.fields.some(field=>prompt[field]!==change.after[field])){
+      pcmToastr.warning('替换后又有未提交的条目编辑，请先处理这些表单，再撤回整批替换。');return false;
+    }
+  }
+  const changes=new Map(action.changes.map(change=>[change.id,change]));
+  preset.prompts=preset.prompts.map(prompt=>{
+    const change=changes.get(prompt.identifier);if(!change)return prompt;
+    const restored={...prompt};
+    for(const field of change.fields){if(Object.hasOwn(change.before,field))restored[field]=change.before[field];else delete restored[field];}
+    if(change.draftBefore)inlineDrafts.set(restored,clone(change.draftBefore));return restored;
+  });
+  state.modified[action.side]=new Set(action.modifiedBefore);
+  const fullyRestored=JSON.stringify(preset)===action.beforeSignature&&action.savedRevision===action.lineage.savedRevision&&state.dirty[action.side];
+  state.dirty[action.side]=fullyRestored?action.dirtyBefore:true;
+  return true;
+}
+function openTextReplace(side,currentId){
+  if(textReplacePanels.has(side)){closeTextReplace(side,true);return;}
+  if(!state[side]){pcmToastr.warning('请先载入这一侧预设');return;}
+  const initial=getTextReplaceContext(side,currentId),list=document.querySelector('[data-list="'+side+'"]'),pane=list?.closest('.pcm-pane');
+  if(!pane)return;
+  const area=currentId?[...document.querySelectorAll('.pcm-inline-form')].find(f=>f.dataset.side===side&&f.dataset.id===currentId)?.querySelector('[name=content]'):null;
+  const selection=area?area.value.slice(area.selectionStart,area.selectionEnd):'';
+  const panel=createTextReplacePanel({title:(side==='old'?'旧版':'新版')+' · '+state[side+'Name'],initialQuery:selection||state.query[side],initialScope:'selected',initialSelectedIds:currentId?[currentId]:initial.selectedIds,
+    getContext:()=>getTextReplaceContext(side,initial.currentId),
+    onApply:(plan,keys,context,options)=>applyTextReplacement(side,plan,keys,context,options),
+    onClose:()=>closeTextReplace(side,true),
+    onLocate:(id,field,start,end)=>{
+      closeTextReplace(side);state.activeId=id;state.activeSide=side;
+      if(state.freeSelect.enabled&&!tempLibrarySide){state.freeSelect[side+'Id']=id;}
+      if(tempLibrarySide)renderTempLibraryDetail(true,true);else renderCompare(true);
+      const form=[...document.querySelectorAll('.pcm-inline-form')].find(f=>f.dataset.side===side&&f.dataset.id===id),input=form?.querySelector('[name="'+field+'"]');
+      if(input){input.focus();input.setSelectionRange(start,end);}
+    }});
+  textReplacePanels.set(side,{panel,pane,preset:state[side]});
+  panel.element.dataset.replaceSide=side;pane.append(panel.element);pane.classList.add('pcm-replacing');
+  document.querySelector('.pcm-app')?.classList.add('pcm-replace-open');
+  pane.querySelector('[data-action=text-replace]')?.setAttribute('aria-expanded','true');
+  if(singleSide===side)hideCompare();
+  panel.element.querySelector('textarea')?.focus();
+}
+function setSingleSide(side){closeTempLibrary(false);closeMigrationDialog();
+  closeTextReplacePanels();
+  const leaving=singleSide;const entering=leaving===side?null:side;
+  if(leaving){singleFilters[leaving]=state.filter[leaving];state.filter[leaving]=dualFilters[leaving];}
+  singleSide=entering;
+  if(entering){dualFilters[entering]=state.filter[entering];state.filter[entering]=singleFilters[entering];}
+  state.activeId=null;state.activeSide=null;hideCompare();cleanupPointerDrag();cleanupTouchDrag();paneLayout?.cancel();
+  const app=document.querySelector('.pcm-app');app.classList.toggle('pcm-single',!!singleSide);app.dataset.singleSide=singleSide||'';
+  for(const pane of app.querySelectorAll('.pcm-pane')){const side=pane.querySelector('[data-list]').dataset.list;pane.classList.toggle('pcm-single-hidden',!!singleSide&&side!==singleSide);const old=pane.querySelector('[data-filter]');old.replaceWith(makePresetFilter(side));const toggle=pane.querySelector('[data-action=single-view]');toggle.textContent=singleSide===side?'双栏':'单栏';toggle.setAttribute('aria-pressed',String(singleSide===side));}
+  renderAll();paneLayout?.refresh();
+}
+function makePresetFilter(side){const single=singleSide===side;const select=presetSelects.create({className:'pcm-preset-filter',label:(side==='old'?'旧版':'新版')+'标签筛选',value:state.filter[side],choices:single?[['all','全部'],['enabled','已启用'],['disabled','已禁用'],['modified','已修改']]:[['all','全部'],['changed','内容有差异'],['uncertain','未确定对应'],['removed','新版已删除'],['added','新版新增'],['same','相同'],['dragged','已拖拽'],['modified','已手动修改']],key:'preset-'+side,minWidth:150,onChange:()=>select.dispatchEvent(new Event('change',{bubbles:true}))});select.dataset.filter=side;return select;}
+function renderTempLibraryDetail(reveal=false,allowUnpaired=false){
+  syncTempLibrarySelection();
+  const side=tempLibrarySide,detail=document.querySelector('[data-compare]'),prompt=side&&byId(side).get(tempLibrarySelection.promptId);
+  if(!detail||!prompt){hideCompare();return;}
+  const item=state.freeSelect.enabled?tempLibrarySession.items.get(tempLibrarySelection.itemId):null;
+  // 自由选择先留在列表，配齐后才展开；明确的检查／替换定位仍可编辑单个条目。
+  if(state.freeSelect.enabled&&!item&&!allowUnpaired){hideCompare();return;}
+  const wasHidden=detail.classList.contains('pcm-hidden'),dialog=detail.closest('.pcm-dialog'),scroll=detail.scrollTop,dialogScroll=dialog.scrollTop;
+  detail._pcmDisposeHighlight?.();detail.replaceChildren();detail.classList.remove('pcm-hidden');
+  detail.dataset.libraryDetail=side;detail.dataset.libraryPaired=String(!!item);
+  const head=el('header','pcm-compare-head'),close=btn('返回列表','collapse','pcm-collapse');
+  if(item){
+    const left=side==='old'?prompt.name:item.name,right=side==='old'?item.name:prompt.name;
+    head.append(el('h3','',left||'未命名条目'),el('h3','pcm-free-new-title',right||'未命名条目'),close);appendDiff(head);
+  }else head.append(el('h3','',prompt.name||'未命名条目'),close);
+  const forms=el('div','pcm-version-forms'),editor=versionEditor(side,prompt);
+  if(item){const preview=createTempLibraryPreview(item,{diffSide:side==='old'?'new':'old'});forms.append(...(side==='old'?[editor,preview]:[preview,editor]));}
+  else forms.append(editor);
+  detail.append(head,forms);detail.closest('.pcm-app').classList.add('pcm-single-detail');setupLiveDiff(detail);
+  if(item){const disposeHighlight=detail._pcmDisposeHighlight,disposeAlignment=alignTempLibraryBodies(forms);detail._pcmDisposeHighlight=()=>{disposeAlignment();disposeHighlight?.();};}
+  if(reveal&&matchMedia('(max-width:900px)').matches)scrollToCompare(detail);
+  else if(!wasHidden){detail.scrollTop=scroll;dialog.scrollTop=dialogScroll;}
+}
+function renderSingleDetail(reveal,side=singleSide){const detail=document.querySelector('[data-compare]'),prompt=byId(side).get(state.activeId);if(!detail||!prompt){hideCompare();return;}detail._pcmDisposeHighlight?.();detail.replaceChildren();detail.classList.remove('pcm-hidden');const head=el('header','pcm-compare-head');head.append(el('h3','',prompt.name||'未命名条目'),btn('返回列表','collapse','pcm-collapse'));const forms=el('div','pcm-version-forms');forms.append(versionEditor(side,prompt));detail.append(head,forms);installVariableReferencePicker(detail,{getPreset:side=>state[side],isInjected:(side,id)=>{const p=byId(side).get(id);return p&&isInjected(side,p);}});const entryTools=installDetailTools(detail);detail._pcmDisposeHighlight=()=>entryTools.dispose();detail.closest('.pcm-app').classList.add('pcm-single-detail');if(reveal&&matchMedia('(max-width:900px)').matches)scrollToCompare(detail);}
+function filtered(side){const q=state.query[side].trim().toLocaleLowerCase(),filter=state.filter[side];return ordered(side).filter(p=>isInjected(side,p)).filter(p=>{const status=statusOf(p.identifier,side);if(singleSide===side&&filter==='enabled'&&!promptEnabled(side,p))return false;if(singleSide===side&&filter==='disabled'&&promptEnabled(side,p))return false;if(filter==='dragged'&&!state.dragged[side].has(p.identifier))return false;if(filter==='modified'&&!state.modified[side].has(p.identifier))return false;if(!['all','dragged','modified',...(singleSide===side?['enabled','disabled']:[])].includes(filter)&&filter!==status)return false;if(!q)return true;return[p.name,p.identifier,p.content].join('\n').toLocaleLowerCase().includes(q);});}
+/* iframe 输入法适配：UI 只处理自身视口和占位；TauriTavern/酒馆主页面的键盘高度由宿主桥转发，
+   不从 iframe 直接访问 parent/top。聚焦时冻结编辑器视窗，键盘弹出后用等高 spacer 保证正文可滚到可见区。 */
+function setupViewportPin(dialog){const touchLikely=matchMedia('(pointer: coarse)').matches||'ontouchstart'in window||navigator.maxTouchPoints>0;if(!touchLikely)return null;let frozen=false,keyboardH=0,bridgeKeyboard=hostEnvironment.keyboardOffset||0,baseInner=0;const isEditable=t=>Boolean(t&&t.closest&&t.closest('.pcm-compare')&&(t.matches('textarea')||t.matches('input')||t.matches('select')));
+  /* 键盘高度取宿主桥、iframe visualViewport 与布局视口收缩量的最大值。 */
+  const readKeyboardH=()=>{const vv=window.visualViewport,inner=window.innerHeight,diff=vv?Math.max(0,inner-vv.height):0;if(inner>baseInner)baseInner=inner;const shrunk=baseInner>inner?baseInner-inner:0;return Math.max(bridgeKeyboard,diff,shrunk);};
+  const spacer=el('div','pcm-ime-spacer');spacer.style.height='0px';dialog.append(spacer);
+  const setH=h=>{dialog.style.setProperty('height',h+'px','important');dialog.style.setProperty('max-height',h+'px','important');};
+  /* 聚焦即冻结：锁定为键盘弹出前的完整高度。 */
+  const freeze=()=>{if(frozen)return;const h=dialog.offsetHeight||window.innerHeight;if(!h)return;setH(h);frozen=true;};
+  const unfreeze=()=>{if(!frozen)return;dialog.style.removeProperty('height');dialog.style.removeProperty('max-height');frozen=false;};
+  /* 键盘高度变化：更新底部占位（>80px 视为键盘弹出）；聚焦编辑框时把它滚到键盘上方（占位区之前）。 */
+  const applyIme=()=>{const h=readKeyboardH();if(h===keyboardH)return;const vv=window.visualViewport;console.debug('[preset-compare-migrator] ime spacer',{keyboard:h,host:bridgeKeyboard,inner:window.innerHeight,vv:vv?vv.height:0});keyboardH=h;spacer.style.height=(h>80?h+16:0)+'px';if(h>80){const f=document.activeElement;if(isEditable(f)){const r=f.getBoundingClientRect(),over=r.bottom+h-dialog.clientHeight+16;if(over>0)dialog.scrollTop+=over;}}};
+  /* 宿主模块通过 TauriTavern layout-kit.subscribeLayout 转发 IME；标准 ST 不加载该适配器。 */
+  const offEnvironment=onHostEnvironment(environment=>{bridgeKeyboard=Math.max(0,Number(environment.keyboardOffset)||0);applyIme();});
+  dialog.addEventListener('focusin',e=>{if(!isEditable(e.target))return;freeze();applyIme();});
+  dialog.addEventListener('focusout',e=>{if(isEditable(e.target)&&!isEditable(e.relatedTarget))unfreeze();});
+  const onVv=()=>applyIme();
+  window.addEventListener('resize',onVv);if(window.visualViewport)window.visualViewport.addEventListener('resize',onVv);
+  /* iframe 自身视口事件与轮询兜底仍保留，覆盖普通浏览器键盘模式。 */
+  let styleObserver=null;try{styleObserver=new MutationObserver(onVv);styleObserver.observe(document.documentElement,{attributes:true,attributeFilter:['style']});}catch{}
+  const imeTimer=setInterval(applyIme,500);return()=>{window.removeEventListener('resize',onVv);if(window.visualViewport)window.visualViewport.removeEventListener('resize',onVv);if(styleObserver)styleObserver.disconnect();offEnvironment();clearInterval(imeTimer);};}
+let viewportPinCleanup=null;
+/* 关闭即销毁：面板 DOM/监听/观察者/定时器全部释放，重开由 shell() 重建（state 数据保留，秒恢复）。幂等；
+   销毁时强制交互锁归零并 flush 待重载（渲染空守卫跳过，仅同步数据），防锁泄漏卡死后续 PRESET_CHANGED。 */
+function destroyPanel(dialog){closeTempLibrary(false);closeMigrationDialog();closePresetCheck();closeTextReplacePanels();presetGroupDrag?.destroy();presetGroupDrag=null;if(singleSide){singleFilters[singleSide]=state.filter[singleSide];state.filter[singleSide]=dualFilters[singleSide];singleSide=null;}presetSelects?.destroy();presetSelects=null;dialog?.querySelector('[data-compare]')?._pcmDisposeHighlight?.();closeRegexPanel();closeVariablesPanel();closeSnapshotPanel();closeWorldbookWorkbench();if(!dialog||!dialog.isConnected)return;paneLayout?.destroy();paneLayout=null;worldbookPlacement?.cancel(false);worldbookPlacement=null;stopDragAutoScroll();cleanupTouchDrag();cleanupPointerDrag();cleanupRegexDrag();clearTimeout(searchTimers.old);clearTimeout(searchTimers.new);searchTimers.old=searchTimers.new=null;touchDrag=null;outerScrollTouch=null;dropMarker=null;dropClass='';dropEndList=null;html5DragPointer=null;pcmInteractionLock=0;for(const [side,name] of [...pcmPendingReload]){pcmPendingReload.delete(side);reloadSideFromTavern(side,name);}if(viewportPinCleanup){try{viewportPinCleanup();}catch{}viewportPinCleanup=null;}tavernPresetPickerData.clear();state.cache.similarity.clear();state.cache.rows.old.clear();state.cache.rows.new.clear();dialog.remove();host.notify('close');}
+/* 重开恢复：销毁重建后从 state 还原搜索词/筛选并填列表（勾选框由 installHeaderToggles 建时初始化）；rAF 先出框架再渲染。 */
+function restorePanelState(dialog){if(!state.old&&!state.new)return;for(const side of['old','new']){const input=dialog.querySelector('[data-search="'+side+'"]');if(input)input.value=state.query[side];const sel=dialog.querySelector('[data-filter="'+side+'"]');if(sel)sel.value=state.filter[side];}requestAnimationFrame(()=>{if(dialog.isConnected)renderAll(false);});}
+let presetSelects=null;
+function shell(){let d=document.getElementById(APP_ID+'-dialog');if(d)return d;d=el('dialog','pcm-dialog');d.id=APP_ID+'-dialog';presetGroupDrag=installPresetGroupDrag(d,{prepare:prepareGroupDrag,resolve:resolveGroupDrop,commit:commitGroupDrop,lock:pcmLock,unlock:pcmUnlock,scrollEdge:dragAutoScrollEdge});presetSelects=createWorkbenchSelects(d);const home=toolboxHome(),app=el('div','pcm-app pcm-view-hidden'),header=el('header','pcm-header'),desktopUndo=iconBtn('undo','撤回上一步操作',PCM_ICONS.undo);desktopUndo.classList.add('pcm-desktop-undo');app.setAttribute('aria-label','预设编辑器');const project=el('div','pcm-project-bar');const drop=el('div','pcm-proj-drop');const name=el('input');name.placeholder='项目名称';name.setAttribute('aria-label','项目名称');name.dataset.projectName='';const dropList=el('div','pcm-proj-list');dropList.dataset.projList='';drop.append(name,dropList);name.addEventListener('click',()=>toggleProjList());name.addEventListener('input',()=>{selectedProjectId=null;});project.append(drop,iconBtn('load-project','加载选中的已保存项目',PCM_ICONS.load),iconBtn('save-project','保存项目（读取项目名称输入框，为空则询问）',PCM_ICONS.save),iconBtn('delete-project','删除选中的已保存项目',PCM_ICONS.trash));const headerToggles=el('div','pcm-header-toggles'),windowActions=el('div','pcm-window-actions');windowActions.append(btn('×','close','pcm-close'));const homeButton=iconBtn('back-toolbox','返回酒馆盒子',PCM_ICONS.home);homeButton.classList.add('pcm-editor-home');project.append(desktopUndo);header.append(homeButton,project,headerToggles,windowActions);app.append(header);const lists=el('section','pcm-lists');lists.append(column('old','旧版预设'),column('new','新版预设'));app.append(lists);const singleGrip=el('div','pcm-single-resizer');singleGrip.tabIndex=0;singleGrip.setAttribute('role','separator');singleGrip.setAttribute('aria-label','调整列表与详情宽度');singleGrip.setAttribute('aria-orientation','vertical');let resizing=false;const resize=x=>{const r=app.getBoundingClientRect(),w=Math.max(340,Math.min(r.width-340,x-r.left));app.style.setProperty('--pcm-single-width',w+'px');singleGrip.setAttribute('aria-valuenow',String(Math.round(w/r.width*100)));};singleGrip.addEventListener('pointerdown',e=>{if(!singleSide)return;resizing=true;singleGrip.setPointerCapture(e.pointerId);e.preventDefault();});singleGrip.addEventListener('pointermove',e=>{if(resizing)resize(e.clientX);});singleGrip.addEventListener('pointerup',()=>resizing=false);singleGrip.addEventListener('pointercancel',()=>resizing=false);singleGrip.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight','Home'].includes(e.key)){e.preventDefault();resize(e.key==='Home'?app.getBoundingClientRect().left+app.clientWidth*.38:singleGrip.getBoundingClientRect().left+(e.key==='ArrowLeft'?-20:20));}});app.append(singleGrip);const detail=el('section','pcm-compare pcm-hidden');detail.dataset.compare='';app.append(detail);d.append(home,app);d.addEventListener('click',onClick);d.addEventListener('change',onChange);d.addEventListener('input',onInput);d.addEventListener('dragstart',onDragStart);d.addEventListener('dragover',onDragOver);d.addEventListener('drop',onDrop);d.addEventListener('dragend',onDragEnd);d.addEventListener('contextmenu',onRowContextMenu);d.addEventListener('touchstart',onOuterScrollTouchStart,{passive:true,capture:true});d.addEventListener('touchmove',onOuterScrollTouchMove,{passive:false,capture:true});d.addEventListener('touchend',onOuterScrollTouchEnd,{passive:true,capture:true});d.addEventListener('touchcancel',onOuterScrollTouchEnd,{passive:true,capture:true});d.addEventListener('touchstart',onTouchStart,{passive:true});d.addEventListener('touchmove',onTouchMove,{passive:false});d.addEventListener('touchend',onTouchEnd,{passive:false});d.addEventListener('touchcancel',onTouchCancel,{passive:true});d.addEventListener('pointerdown',onRowPointerDown);d.addEventListener('pointermove',onRowPointerMove);d.addEventListener('pointerup',onRowPointerUp);d.addEventListener('pointercancel',onRowPointerCancel);d.addEventListener('touchstart',onRegexTouchStart,{passive:true});d.addEventListener('touchmove',onRegexTouchMove,{passive:false});d.addEventListener('touchend',onRegexTouchEnd,{passive:false});d.addEventListener('touchcancel',onRegexTouchCancel,{passive:true});d.addEventListener('pointerdown',onRegexPointerDown);d.addEventListener('pointermove',onRegexPointerMove);d.addEventListener('pointerup',onRegexPointerUp);d.addEventListener('pointercancel',onRegexPointerCancel);d.addEventListener('touchstart',onTouchContactChange,{passive:true,capture:true});d.addEventListener('touchend',onTouchContactChange,{passive:true,capture:true});d.addEventListener('touchcancel',onTouchContactChange,{passive:true,capture:true});d.addEventListener('focusin',e=>{if(isCompareEditable(e.target))pcmLock();});d.addEventListener('focusout',e=>{if(isCompareEditable(e.target)&&!isCompareEditable(e.relatedTarget))pcmUnlock();});d.addEventListener('click',onToggleEnabledClick,true);d.addEventListener('click',onTavernPickerClick,true);d.addEventListener('change',onHeaderToggleChange,true);d.addEventListener('click',onFreeSelectClick,true);/* Esc 分层退出：dialog 原生 cancel(Esc) 会直接关闭整个 iframe 前端；
+   有浮层（选择器/正则/变量面板/项目下拉）打开时应只关浮层。keydown 捕获先于原生 cancel 触发，preventDefault 即可拦截。 */d.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.target.closest?.('.pcm-migration-modal'))return;const layers=document.querySelectorAll('.pcm-picker.open,.pcm-proj-drop.open');if(!layers.length)return;e.preventDefault();e.stopPropagation();layers.forEach(l=>{if(l.hasAttribute('data-regex-panel'))closeRegexPanel();else if(l.hasAttribute('data-worldbook-panel'))l.remove();else l.classList.remove('open');});d.classList.remove('pcm-regex-open','pcm-worldbook-open');});d.addEventListener('cancel',e=>{if(e.target===d){e.preventDefault();void requestPanelClose();}});d.addEventListener('close',()=>destroyPanel(d));document.body.append(d);viewportPinCleanup=setupViewportPin(d);installHeaderToggles();paneLayout=installPaneLayout(d,onHostEnvironment);installSyncScroll();refreshProjects();updateUndoButton();return d;}
+function column(side,title){const pane=el('section','pcm-pane');const head=el('header','pcm-pane-head');const info=el('div');info.append(el('h3','',title));if(side==='old'){const paneUndo=iconBtn('undo','撤回上一步操作',PCM_ICONS.undo);paneUndo.classList.add('pcm-pane-undo');info.append(paneUndo);}const filename=el('span','', '尚未导入');filename.dataset.fileName=side;info.append(filename);const actions=el('div','pcm-actions');const importLabel=el('label','menu_button pcm-import');importLabel.title='导入预设 JSON 文件';const impIcon=el('span','pcm-btn-icon');impIcon.innerHTML=PCM_ICONS.import;importLabel.append(impIcon,el('span','pcm-btn-text','导入'));const input=el('input');input.type='file';input.accept='.json,application/json';input.dataset.file=side;importLabel.append(input);const exportBtn=btn('导出','export','pcm-primary',side);exportBtn.title='导出当前版本的预设 JSON 文件';const expIcon=el('span','pcm-btn-icon');expIcon.innerHTML=PCM_ICONS.exportIcon;exportBtn.textContent='';exportBtn.append(expIcon,el('span','pcm-btn-text','导出'));const tavernBtn=btn('','pull-tavern','',side);tavernBtn.append(el('span','pcm-btn-text','酒馆预设'),el('span','pcm-btn-tavern-short','酒馆'));actions.append(tavernBtn);actions.append(importLabel,btn('保存','save-tavern','',side),exportBtn);const varBtn=btn('变量','manage-vars','',side);varBtn.title='打开「获取变量」面板：检查哪些条目的变量没写进总条目（可一键写入）、直接编辑保存总条目原文；可切换至「引用变量」界面';actions.append(varBtn);head.append(info,actions);pane.append(head);const tools=el('div','pcm-tools');const search=el('input');search.type='search';search.placeholder='搜索名称、ID 或正文';search.dataset.search=side;const select=makePresetFilter(side);const worldbookBtn=btn('世界书','manage-worldbook','',side);worldbookBtn.title='将世界书条目缝合到这一侧预设';const groupBtn=btn('分组','new-group','pcm-new-group',side);groupBtn.disabled=!state[side];groupBtn.title='选择首尾条目，将整段归为一组';const reserved=btn('单栏','single-view','pcm-single-toggle',side);reserved.setAttribute('aria-pressed','false');const replaceBtn=btn('替换','text-replace','pcm-replace-toggle',side);replaceBtn.title='查找替换这一侧预设的正文或名称';replaceBtn.setAttribute('aria-expanded','false');tools.append(search,replaceBtn,select,reserved,btn('AI缝合','ai-stitch','',side),groupBtn,worldbookBtn);pane.append(tools);const summary=el('div','pcm-summary','导入后显示条目');summary.dataset.summary=side;pane.append(summary);const list=el('div','pcm-list');list.dataset.list=side;pane.append(list);return pane;}
+function replaceImportedPreset(side,preset,fileName,tavernSource){
+  state[side]=validate(preset);
+  discardSideUndo(side);
+  resetImportedGroups(side);state.modified[side].clear();state.dragged[side].clear();
+  state[side+'Name']=fileName;state.tavernSource[side]=tavernSource;state.dirty[side]=false;
+  state.activeId=null;state.activeSide=null;hideCompare();rebuildCache();renderAll(false);
+}
+async function loadFile(side,file){try{replaceImportedPreset(side,JSON.parse(await file.text()),file.name,null);}catch(e){pcmToastr.error(e.message,'导入失败');}}
+function renderAll(keepScroll=true,revealCompare=false){if(!document.getElementById(APP_ID+'-dialog'))return;for(const [side,record] of textReplacePanels){if(state[side]!==record.preset)closeTextReplace(side);else record.panel.refresh?.();}renderList('old',keepScroll);renderList('new',keepScroll);syncTempLibraryControls();if(singleSide&&textReplacePanels.has(singleSide))return;if(!singleSide&&!tempLibrarySide&&state.freeSelect.enabled&&state.freeSelect.oldId&&state.freeSelect.newId)renderFreeCompare(revealCompare);else if(state.activeId)renderCompare(revealCompare);if(document.querySelector('[data-regex-panel].open'))renderRegexPanel();}
+function createPromptRow(side,p){const status=statusOf(p.identifier,side),enabled=promptEnabled(side,p),groupState=getBaiBaiGroupState(state[side]),selectedForGroup=state.grouping.side===side&&state.grouping.startId===p.identifier,selectedForFree=state.freeSelect.enabled&&(tempLibrarySide?(side===tempLibrarySide&&state.activeSide===side&&state.activeId===p.identifier):state.freeSelect[side+'Id']===p.identifier),selectedForMs=state.multiSelect.enabled&&state.multiSelect.selected[side].has(p.identifier),row=el('article','pcm-row'+(enabled?'':' pcm-row-disabled')+(isComparisonActive(side,p.identifier)?' active':'')+(selectedForGroup?' pcm-group-selected':'')+(selectedForFree?' pcm-free-selected':'')+(selectedForMs?' pcm-ms-selected':'')),open=el('button','pcm-open');/* 行不带 draggable：桌面拖拽全走指针路径；WebView2(TauriTavern) 下 draggable=true 会在指针移动时启动原生 DnD 手势，dragstart 不触发却把 pointer 流用 pointercancel 掐死 → 拖拽秒退（v1.4.6 教训）。 */row.title=comparisonHint(p.identifier,side);row.dataset.dragId=p.identifier;row.dataset.dragSide=side;open.type='button';open.dataset.open=p.identifier;open.dataset.side=side;const title=el('span','pcm-row-title');title.append(el('span','pcm-name',p.name||'(未命名)'));const warning=el('span','pcm-draft-warning');warning.innerHTML=DRAFT_WARNING_SVG;warning.hidden=!showsDraftWarning(side,p);warning.title='条目有未保存编辑';warning.setAttribute('role','img');warning.setAttribute('aria-label','条目有未保存编辑');title.append(warning);const tags=el('span','pcm-operation-tags');const enabledSwitch=el('span','pcm-switch '+(enabled?'pcm-op-enabled':'pcm-op-disabled'));enabledSwitch.setAttribute('role','switch');enabledSwitch.setAttribute('aria-checked',String(enabled));enabledSwitch.title=enabled?'已启用':'已禁用';const switchTrack=el('span','pcm-switch-track');switchTrack.append(el('span','pcm-switch-knob'));enabledSwitch.append(switchTrack);tags.append(enabledSwitch);if(state.dragged[side].has(p.identifier))tags.append(el('span','pcm-op-tag pcm-op-dragged','已拖拽'));if(state.modified[side].has(p.identifier))tags.append(el('span','pcm-op-tag pcm-op-modified','已修改'));title.append(tags);open.append(title,el('code','',p.identifier));const rowActions=el('span','pcm-row-actions'),dupBtn=el('button','pcm-row-action','⧉'),delBtn=el('button','pcm-row-action pcm-row-del','🗑');dupBtn.type='button';dupBtn.title='复制此条目';dupBtn.dataset.action='duplicate-prompt';dupBtn.dataset.side=side;dupBtn.dataset.id=p.identifier;delBtn.type='button';delBtn.title='删除此条目';delBtn.dataset.action='delete-prompt';delBtn.dataset.side=side;delBtn.dataset.id=p.identifier;rowActions.append(dupBtn,delBtn);row.append(open,rowActions,el('span','pcm-badge pcm-'+status,badgeText(p.identifier,side)));return row;}
+/* 行级 DOM 复用（仿 paintBackdrop 的 _k 键控）：渲染键必须覆盖 createPromptRow 的全部视觉状态，改 createPromptRow 时同步改 rowKey；
+   复用前剥掉拖拽临时类防脏；renderList 每轮 prune 未命中项，删除条目后不泄漏缓存。 */
+function rowKey(side,p){const groupState=getBaiBaiGroupState(state[side]);return[p.identifier,counterpartId(side,p.identifier),comparisonHint(p.identifier,side),statusOf(p.identifier,side),promptEnabled(side,p),isComparisonActive(side,p.identifier),state.grouping.side===side&&state.grouping.startId===p.identifier,state.freeSelect.enabled&&(tempLibrarySide?(side===tempLibrarySide&&state.activeSide===side&&state.activeId===p.identifier):state.freeSelect[side+'Id']===p.identifier),state.multiSelect.enabled&&state.multiSelect.selected[side].has(p.identifier),state.dragged[side].has(p.identifier),state.modified[side].has(p.identifier),showsDraftWarning(side,p),badgeText(p.identifier,side),p.name||''].join('|');}
+function rowFor(side,p,used){if(used)used.add(p.identifier);const key=rowKey(side,p),cache=state.cache.rows[side],cached=cache.get(p.identifier);if(cached&&cached._k===key){cached.classList.remove('pcm-drop-before','pcm-drop-after','pcm-dragging');return cached;}const row=createPromptRow(side,p);row._k=key;cache.set(p.identifier,row);return row;}
+function groupMeta(side){const groupState=getBaiBaiGroupState(state[side]);if(!groupState?.groups?.length)return null;return{state:groupState,groups:new Map(groupState.groups.map(group=>[String(group.id),group]))};}
+function renderInjectedList(side,used){const preset=state[side],list=document.querySelector('[data-list="'+side+'"]'),summary=document.querySelector('[data-summary="'+side+'"]');if(!list)return;list.replaceChildren();const pane=list.closest('.pcm-pane');const groupBtn=pane?.querySelector('[data-action=new-group]');if(groupBtn){groupBtn.disabled=!preset;groupBtn.textContent=state.grouping.side===side?'取消':'分组';}if(!preset){pane?.classList.remove('pcm-loaded');setSummaryText(summary,'导入后显示条目',side);return;}pane?.classList.add('pcm-loaded');document.querySelector('[data-file-name="'+side+'"]').textContent=state[side+'Name'];const prompts=filtered(side),counts={uncertain:0,changed:0,removed:0,added:0,same:0};ordered(side).forEach(p=>counts[statusOf(p.identifier,side)]++);setSummaryText(summary,preset.prompts.length+' 条 · 修改 '+counts.changed+' · '+(side==='old'?'新版删除 '+counts.removed:'新增 '+counts.added)+(counts.uncertain?' · 未确定 '+counts.uncertain:'')+(state.dirty[side]?' · 有未导出修改':''),side);const meta=groupMeta(side);const groupingBar=el('div','pcm-range-group-bar');if(state.grouping.side===side)groupingBar.append(el('span','pcm-range-group-hint',state.grouping.startId?'已选起点，请点击终点（包含中间全部条目）':'请点击范围的第一条，再点击最后一条'));if(state.grouping.side===side)list.append(groupingBar);if(!meta){for(const p of prompts)list.append(rowFor(side,p,used));return;}const ungroupedKeys=new Map();let ungroupedStart=null;for(const p of ordered(side)){const id=meta.state.prompts?.[p.identifier]?.groupId;if(id&&meta.groups.has(String(id))){ungroupedStart=null;continue;}ungroupedStart??=p.identifier;ungroupedKeys.set(p.identifier,JSON.stringify(['ungrouped',ungroupedStart]));}const groupCounts=new Map();for(const cp of prompts){const rg2=meta.state.prompts?.[cp.identifier]?.groupId,g2=rg2&&meta.groups.has(String(rg2))?String(rg2):'';const k2=g2||ungroupedKeys.get(cp.identifier);groupCounts.set(k2,(groupCounts.get(k2)||0)+1);}let currentKey=Symbol('start'),currentBody=null,currentCollapsed=false;for(const prompt of prompts){const rawGroupId=meta.state.prompts?.[prompt.identifier]?.groupId,groupId=rawGroupId&&meta.groups.has(String(rawGroupId))?String(rawGroupId):'',key=groupId||ungroupedKeys.get(prompt.identifier);if(key!==currentKey){currentKey=key;const groupData=groupId?meta.groups.get(groupId):null,gk='g:'+side+':'+key;currentCollapsed=!!state.groupCollapsed[gk];const group=el('section','pcm-group'+(groupId?'':' pcm-ungrouped')+(currentCollapsed?' pcm-collapsed':''));group._pcmGroupKey=gk;group._pcmPromptIds=[];if(groupId){group.dataset.groupId=groupId;group.dataset.groupSide=side;}const head=el('header','pcm-group-head'),toggle=el('button','pcm-group-toggle'),title=el('span','pcm-group-title',groupData?.name||'\u672a\u5206\u7ec4'),actions=el('span','pcm-group-actions');toggle.type='button';toggle.dataset.action='toggle-group';toggle.dataset.side=side;toggle.dataset.groupKey=gk;toggle.setAttribute('aria-expanded',String(!currentCollapsed));toggle.append(el('span','pcm-group-caret',currentCollapsed?'\u25b6':'\u25bc'),title,el('small','',String(groupCounts.get(key)||0)+' \u6761'));if(groupId){appendPresetGroupActions(actions,group,groupData,side);if(state.grouping.side===side&&String(state.grouping.groupId)===groupId)actions.append(btn('\u5b8c\u6210\u5206\u7ec4','finish-group','pcm-group-finish',side));}head.append(toggle,actions);group.append(head);currentBody=el('div','pcm-group-body');currentBody.hidden=currentCollapsed;group.append(currentBody);list.append(group);}currentBody.parentElement._pcmPromptIds.push(prompt.identifier);if(!currentCollapsed)currentBody.append(rowFor(side,prompt,used));}}
+function renderList(side,keepScroll=true){const list=document.querySelector('[data-list="'+side+'"]');if(!list)return;withListOrderIndex(side,()=>{const st=list.scrollTop,used=new Set();try{renderInjectedList(side,used);appendUnInjectedGroup(side,list,used);}finally{const cache=state.cache.rows[side];for(const id of[...cache.keys()])if(!used.has(id))cache.delete(id);}bindEnabledTags(side);renderMultiDelete(side);syncTempLibraryControls();list.scrollTop=keepScroll?st:0;});}
+// 折叠只更新同一分组的当前可见片段，其他组与编辑器节点保持原位。
+// 折叠体中移除行节点，保留拖拽代码对“空分组体”的既有判断。
+function toggleRenderedGroup(side,key){
+  if(!key)return;
+  const list=document.querySelector('[data-list="'+side+'"]'),collapsed=!state.groupCollapsed[key];
+  state.groupCollapsed[key]=collapsed;
+  const sections=[...(list?.children||[])].filter(group=>group._pcmGroupKey===key);
+  if(!sections.length){renderList(side);return;}
+  const scrollTop=list.scrollTop;
+  withListOrderIndex(side,()=>{for(const group of sections){
+    const body=group.querySelector('.pcm-group-body'),toggle=group.querySelector('.pcm-group-toggle');
+    if(!body||!toggle)continue;
+    group.classList.toggle('pcm-collapsed',collapsed);toggle.setAttribute('aria-expanded',String(!collapsed));
+    toggle.querySelector('.pcm-group-caret').textContent=collapsed?'\u25b6':'\u25bc';
+    body.replaceChildren();body.hidden=collapsed;
+    for(const id of group._pcmPromptIds){
+      if(collapsed){state.cache.rows[side].delete(id);continue;}
+      const prompt=byId(side).get(id);if(prompt)body.append(rowFor(side,prompt));
+    }
+  }});
+  bindEnabledTags(side);list.scrollTop=scrollTop;
+}
+function hideCompare(){document.querySelector('.pcm-app')?.classList.remove('pcm-single-detail');const detail=document.querySelector('[data-compare]');if(detail){delete detail.dataset.libraryDetail;delete detail.dataset.libraryPaired;detail._pcmDisposeHighlight?.();detail.classList.add('pcm-hidden');detail.replaceChildren();}}
+function valueText(value){if(value===undefined)return'此版本没有该条目';return typeof value==='string'?value:JSON.stringify(value,null,2);}
+/* 混合粒度 diff：先做行级比对，再把相邻「删除块+新增块」配对成行对。英文等空格分词语言按完整单词与标点比较，避免把一个单词拆成零散字母；中日韩无空格文字仍逐字比较，保留精确高亮。公共前后缀裁剪 + Myers O(ND)，多重阈值保护防超长文本在手机端内存膨胀，超限自动退化为整段标记。 */
+function appendDiff(head){const tog=el('label','pcm-free-select pcm-diff-toggle'),cb=el('input');cb.type='checkbox';cb.checked=state.showDiff;cb.dataset.toggleDiff='';tog.append(cb,el('span','','正文差异'));head.append(tog);}
+/* 保存回酒馆预设本体：iframe 只把纯数据发给宿主桥；宿主模块调用 preset-manager.savePreset，
+   再把酒馆内存中的最新预设克隆返回。仅对「酒馆预设」载入的一侧有效；本地文件仍需导出。 */
+function applyTavernPreset(side,name,fresh){if(!fresh)return false;state[side]=validate(clone(fresh));state[side+'Name']=name+'.json';state.dirty[side]=false;state.modified[side].clear();state.dragged[side].clear();rebuildCache();renderAll();return true;}
+const savingPresetSides=new Set(),savingPresetNames=new Set();
+function isSideSavePending(side){return savingPresetSides.has(side);}
+function hasPendingInlineDrafts(side){return (state[side]?.prompts||[]).some(prompt=>isPendingPromptDraft(prompt,inlineDrafts.get(prompt)));}
+async function saveSideToTavern(side){
+  const name=state.tavernSource[side],preset=state[side];
+  if(!preset){pcmToast('请先导入'+(side==='old'?'旧版':'新版')+'预设','warning');return;}
+  if(!name){pcmToast('该预设来自本地文件，无法原地写回，请用「导出」保存','warning');return;}
+  if(savingPresetSides.has(side)||savingPresetNames.has(name)){pcmToast('该预设正在保存，请等待本次保存完成。','info');return;}
+  const pendingDrafts=hasPendingInlineDrafts(side);
+  const snapshot=JSON.stringify(preset),draftSnapshot=JSON.stringify(buildPresetDraftSnapshot(preset,inlineDrafts));
+  savingPresetSides.add(side);savingPresetNames.add(name);
+  try{
+    if(pendingDrafts){
+      const choice=await choosePresetSave({parent:shell()});
+      if(!choice)return;
+      if(state[side]!==preset||state.tavernSource[side]!==name
+         ||JSON.stringify(preset)!==snapshot
+         ||JSON.stringify(buildPresetDraftSnapshot(preset,inlineDrafts))!==draftSnapshot){
+        pcmToast('预设或条目编辑已变化，本次未保存。请核对后重新点击保存。','info');return;
+      }
+      if(choice==='check'){
+        state.showDraftMarkers[side]=true;syncDraftControls();refreshDraftIndicators(side);void saveUiPrefs();return;
+      }
+      if(choice!=='save')return;
+    }
+    const payload=pendingDrafts?JSON.parse(draftSnapshot):clone(preset);
+    const fresh=await host.request('save-preset',{name,preset:payload});
+    if(state[side]!==preset||state.tavernSource[side]!==name||JSON.stringify(preset)!==snapshot||JSON.stringify(buildPresetDraftSnapshot(preset,inlineDrafts))!==draftSnapshot){
+      if(state[side]===preset)state.dirty[side]=true;
+      pcmToast('已保存发起时的预设版本；保存期间又有编辑或切换，当前草稿已保留，请核对后再保存。','info');return;
+    }
+    if(!applyTavernPreset(side,name,fresh))throw Error('保存完成，但未能从酒馆读回最新预设');
+    pcmToast('已保存回酒馆预设「'+name+'」','success');
+  }catch(error){console.error('[preset-compare-migrator] save to tavern failed',error);pcmToast('保存回酒馆失败：'+error.message,'error');}
+  finally{savingPresetSides.delete(side);savingPresetNames.delete(name);}
+}
+/* 保存后或收到宿主事件后，按名经桥请求酒馆中的最新预设。 */
+async function reloadSideFromTavern(side,name){
+  const preset=state[side],snapshot=JSON.stringify(preset);
+  if(state.tavernSource[side]!==name||state.dirty[side]||hasPendingInlineDrafts(side)||isSideSavePending(side))return;
+  try{
+    const fresh=await host.request('read-preset',{name});
+    if(state[side]!==preset||state.tavernSource[side]!==name||state.dirty[side]||hasPendingInlineDrafts(side)||isSideSavePending(side)||JSON.stringify(preset)!==snapshot)return;
+    if(!fresh||JSON.stringify(fresh)===snapshot)return;
+    if(applyTavernPreset(side,name,fresh))discardSideUndo(side);
+  }catch(error){console.warn('[preset-compare-migrator] reload preset failed',error);}
+}
+/* 交互锁（自身鲁棒性，不针对特定插件）：长按拖拽/HTML5拖拽/编辑聚焦等精细操作期间 +1；期间若酒馆自身或任意第三方插件触发 PRESET_CHANGED，不立即 reload 重建 DOM（会把正在操作的行变成游离节点导致命中错位/跳条目），而是记入待重载表，操作全部结束（锁归零）后统一同步一次。 */
+let pcmInteractionLock=0,html5DragLock=false;const pcmPendingReload=new Map();function pcmLock(){pcmInteractionLock++;}function pcmUnlock(){pcmInteractionLock=Math.max(0,pcmInteractionLock-1);if(pcmInteractionLock===0){for(const [side,name] of [...pcmPendingReload]){pcmPendingReload.delete(side);reloadSideFromTavern(side,name);}}}function requestSideReload(side,name){if(pcmInteractionLock>0){pcmPendingReload.set(side,name);return;}reloadSideFromTavern(side,name);}const isCompareEditable=t=>Boolean(t&&t.closest&&t.closest('.pcm-compare')&&(t.matches('textarea')||t.matches('input')||t.matches('select')));
+/* 宿主模块监听酒馆 PRESET_CHANGED，再通过 MessagePort 转发最小事件数据。
+   iframe 在交互锁释放后按名请求最新预设；有未导出修改的一侧跳过同步，避免覆盖用户编辑。 */
+function watchTavernPresetEvents(){host.on('preset-changed',data=>{if(!data||(data.apiId&&data.apiId!=='openai')||!data.name)return;for(const side of['old','new']){if(state.tavernSource[side]===data.name&&!state.dirty[side]&&!hasPendingInlineDrafts(side)&&!isSideSavePending(side))requestSideReload(side,data.name);}});}
+function paintBackdrop(bd,rows,side,query=''){
+  const highlighted=buildSearchRows(rows,side,query),kids=bd.children;
+  for(let i=0;i<highlighted.length;i++){
+    const row=highlighted[i];let node=kids[i];
+    if(!node){node=el('span');bd.append(node);}
+    // The key includes match positions as well as diff state; query-only refreshes must repaint.
+    const key=JSON.stringify(row);
+    if(node._k===key)continue;
+    node.className=row.t===' '?'ctx':(row.t==='-'?'del':'add')+(row.paired?' paired':'');
+    const frag=document.createDocumentFragment();
+    for(const seg of row.segs){
+      let target=frag;
+      if(seg.t!==' '){target=el('span',seg.t==='-'?'d':'a');frag.append(target);}
+      if(seg.hit)target.append(el('mark','pcm-search-hit',seg.text));
+      else target.append(document.createTextNode(seg.text));
+    }
+    node.replaceChildren(frag);node._k=key;
+  }
+  while(kids.length>highlighted.length)bd.lastChild.remove();
+}
+function layoutCompareHeader(detail){
+  const head=detail.querySelector('.pcm-compare-head'),close=head.querySelector('.pcm-collapse'),diff=head.querySelector('.pcm-diff-toggle');
+  const corner=el('div','pcm-compare-corner');if(diff)corner.append(diff);if(close)corner.append(close);head.append(corner);
+  for(const action of head.querySelectorAll('[data-action=migrate]')){
+    const heading=[...detail.querySelectorAll('.pcm-version-editor')].find(editor=>editor.querySelector('form')?.dataset.side===action.dataset.side)?.querySelector('.pcm-variable-entry-heading');
+    if(!heading)continue;const copy=action.cloneNode(true);copy.classList.add('pcm-desktop-migrate');heading.insertBefore(copy,heading.lastElementChild);
+  }
+  if(head.querySelector('.pcm-free-new-title'))head.classList.add('pcm-free-compare-head');
+}
+function setupLiveDiff(detail){
+  installVariableReferencePicker(detail,{getPreset:side=>state[side],isInjected:(side,id)=>{const prompt=byId(side).get(id);return prompt&&isInjected(side,prompt);}});
+  layoutCompareHeader(detail);
+  const entryTools=installDetailTools(detail);
+  const areas=[...detail.querySelectorAll('.pcm-live-area')];if(!areas.length)return;
+  const diffSide=area=>area.dataset.diffSide||area.form?.dataset.side;
+  const oldArea=areas.find(a=>diffSide(a)==='old'),newArea=areas.find(a=>diffSide(a)==='new');
+  const sync=(area,bd)=>{bd.scrollTop=area.scrollTop;bd.scrollLeft=area.scrollLeft;};
+  const align=(area,bd)=>{
+    const cs=getComputedStyle(area);
+    for(const prop of ['fontFamily','fontSize','fontWeight','fontStyle','lineHeight','letterSpacing','wordSpacing','textIndent','textTransform','tabSize','whiteSpace','overflowWrap','wordBreak'])bd.style[prop]=cs[prop];
+    // Use the text control's client box so a scrollbar or manual resize cannot shift wrapping.
+    bd.style.right='auto';bd.style.bottom='auto';
+    bd.style.width=area.clientWidth+'px';bd.style.height=area.clientHeight+'px';
+    bd.style.left=(area.offsetLeft+area.clientLeft)+'px';bd.style.top=(area.offsetTop+area.clientTop)+'px';
+    for(const edge of ['Top','Right','Bottom','Left'])bd.style['padding'+edge]=cs['padding'+edge];
+  };
+  let timer=null,lastOld,lastNew,cachedRows;
+  const update=()=>{
+    if(!detail.isConnected||areas.some(a=>!detail.contains(a))){clearTimeout(timer);observer?.disconnect();return;}
+    const diff=state.showDiff&&oldArea&&newArea;
+    if(diff&&(lastOld!==oldArea.value||lastNew!==newArea.value||!cachedRows)){
+      lastOld=oldArea.value;lastNew=newArea.value;cachedRows=buildRows(diffLines(lastOld,lastNew));
+    }
+    for(const area of areas){
+      if(area._pcmRandomEditor?.isEnabled())continue;
+      const bd=area.previousElementSibling,side=diffSide(area),query=area.form?state.query[area.form.dataset.side]:tempLibrarySession.query;
+      area.parentElement.classList.toggle('live',!!diff||!!normalizeSearchQuery(query));
+      align(area,bd);paintBackdrop(bd,diff?cachedRows:plainSearchRows(area.value),side,query);sync(area,bd);
+    }
+  };
+  const refresh=()=>{clearTimeout(timer);update();};
+  const deb=()=>{clearTimeout(timer);timer=setTimeout(update,150);};
+  for(const area of areas){
+    area.addEventListener('input',deb);area.addEventListener('change',refresh);
+    area.addEventListener('scroll',()=>sync(area,area.previousElementSibling));
+  }
+  // Local events refresh only decoration: forms, selection, scroll and unsaved fields stay intact.
+  detail.addEventListener('pcm-search-refresh',refresh);
+  detail.addEventListener('pcm-random-mode',refresh);
+  const toggle=event=>{if(event.target.matches?.('[data-toggle-diff]')){
+    state.showDiff=event.target.checked;saveUiPrefs();event.stopPropagation();refresh();
+  }};
+  detail.addEventListener('change',toggle);
+  const observer=typeof ResizeObserver==='function'?new ResizeObserver(refresh):null;
+  areas.forEach(area=>observer?.observe(area));
+  detail._pcmDisposeHighlight=()=>{entryTools.dispose();clearTimeout(timer);observer?.disconnect();detail.removeEventListener('pcm-search-refresh',refresh);detail.removeEventListener('pcm-random-mode',refresh);detail.removeEventListener('change',toggle);};
+  update();
+}
+const triggerOptions=[['','所有选项（默认）'],['normal','正常'],['continue','续写'],['impersonate','AI 帮答'],['swipe','备选回复'],['regenerate','重新生成'],['quiet','静默']];function triggerValue(prompt){return Array.isArray(prompt?.injection_trigger)&&prompt.injection_trigger.length?String(prompt.injection_trigger[0]||''):'';}
+/* 跳转编辑区：触屏设备用即时定位（平滑滚动在移动端长页面会卡顿），桌面端保留平滑；rAF 确保 DOM 先完成布局再滚动。 */
+function scrollToCompare(node){requestAnimationFrame(()=>{node.scrollIntoView({behavior:matchMedia('(hover: none)').matches?'auto':'smooth',block:'start'});});}
+function renderCompare(reveal=false){if(tempLibrarySide){renderTempLibraryDetail(reveal);return;}if(singleSide){renderSingleDetail(reveal);return;}const detail=document.querySelector('[data-compare]');if(!detail)return;const {old:oldPrompt,new:newPrompt}=comparisonPrompts(state.activeId);if(!oldPrompt&&!newPrompt){hideCompare();return;}const status=statusOf(state.activeId),current=(state.activeSide==='old'?oldPrompt:newPrompt)||oldPrompt||newPrompt;const wasHidden=detail.classList.contains('pcm-hidden'),dlg=detail.closest('.pcm-dialog'),dlgSt=wasHidden?null:(dlg?dlg.scrollTop:0),ownSt=wasHidden?null:detail.scrollTop;detail._pcmDisposeHighlight?.();detail.replaceChildren();detail.classList.remove('pcm-hidden');const head=el('header','pcm-compare-head'),info=el('div');info.append(el('span','pcm-badge pcm-'+status,statusText[status]),el('h3','',current.name||'(未命名)'));const hint=comparisonHint(state.activeId);if(hint)info.append(el('small','',hint));const actions=el('div','pcm-compare-actions');if(oldPrompt&&status!=='uncertain')actions.append(btn(newPrompt?'用旧版覆盖新版':'迁移到新版','migrate','pcm-primary','old'));if(newPrompt&&status!=='uncertain')actions.append(btn(oldPrompt?'用新版覆盖旧版':'迁移到旧版','migrate','pcm-primary','new'));const close=btn('×','collapse','pcm-collapse');close.title='收起对比';actions.append(close);head.append(info,actions);if(oldPrompt&&newPrompt)appendDiff(head);detail.append(head);const forms=el('div','pcm-version-forms');forms.append(versionEditor('old',oldPrompt),versionEditor('new',newPrompt));detail.append(forms);setupLiveDiff(detail);if(wasHidden||reveal){detail.scrollTop=0;scrollToCompare(detail);}else{if(dlg&&dlgSt!==null)dlg.scrollTop=dlgSt;if(ownSt!==null)detail.scrollTop=ownSt;}}
+function renderFreeCompare(reveal=false){if(tempLibrarySide){renderTempLibraryDetail(reveal);return;}const detail=document.querySelector('[data-compare]');if(!detail)return;const oldPrompt=byId('old').get(state.freeSelect.oldId),newPrompt=byId('new').get(state.freeSelect.newId);if(!oldPrompt||!newPrompt)return;const wasHidden=detail.classList.contains('pcm-hidden'),dlg=detail.closest('.pcm-dialog'),dlgSt=wasHidden?null:(dlg?dlg.scrollTop:0),ownSt=wasHidden?null:detail.scrollTop;detail._pcmDisposeHighlight?.();detail.replaceChildren();detail.classList.remove('pcm-hidden');const head=el('header','pcm-compare-head'),info=el('div'),close=btn('×','collapse','pcm-collapse');info.append(el('span','pcm-badge pcm-changed','自由选择'),el('h3','',oldPrompt.name));close.title='收起对比';head.append(info,el('h3','pcm-free-new-title',newPrompt.name),close);appendDiff(head);detail.append(head);const forms=el('div','pcm-version-forms');forms.append(versionEditor('old',oldPrompt),versionEditor('new',newPrompt));detail.append(forms);setupLiveDiff(detail);if(wasHidden||reveal){detail.scrollTop=0;scrollToCompare(detail);}else{if(dlg&&dlgSt!==null)dlg.scrollTop=dlgSt;if(ownSt!==null)detail.scrollTop=ownSt;}}
+function versionEditor(side,prompt){const wrap=el('section','pcm-version-editor');wrap.append(el('h4','',side==='old'?'旧版条目':'新版条目'));if(!prompt){wrap.append(el('div','pcm-missing',!state.freeSelect.enabled&&statusOf(state.activeId)==='uncertain'?'尚未确定此版本的对应条目':'此版本没有该条目'));return wrap;}const form=el('form','pcm-inline-form');form.dataset.side=side;form.dataset.id=prompt.identifier;form.append(field('姓名','name',prompt.name),selectField('身份','role',prompt.role||'system',[['system','系统'],['user','用户'],['assistant','AI 助手']]),selectField('触发器','trigger',triggerValue(prompt),triggerOptions),selectField('位置','injection_position',prompt.injection_position??0,[['0','相对'],['1','聊天中']]));const chat=el('div','pcm-inline-chat');chat.append(field('深度','injection_depth',prompt.injection_depth??4,'number'),field('顺序','injection_order',prompt.injection_order??100,'number'));chat.hidden=prompt.injection_position!==1;form.append(chat);const pos=form.querySelector('[name=injection_position]');pos.addEventListener('change',()=>{chat.hidden=pos.value!=='1';});const contentLabel=el('label','pcm-inline-content');contentLabel.append(el('span','', '正文'));const editWrap=el('div','pcm-editwrap'+(state.showDiff?' live':'')),backdrop=el('pre','pcm-diff-backdrop'),area=el('textarea');backdrop.setAttribute('aria-hidden','true');area.name='content';area.className='pcm-live-area';area.value=prompt.content||'';editWrap.append(backdrop,area);contentLabel.append(editWrap);form.append(contentLabel);const save=btn(singleSide?'保存':'保存'+(side==='old'?'旧版':'新版')+'条目','save-inline','pcm-primary',side);save.type='submit';form.append(save);const draft=inlineDrafts.get(prompt);if(draft)for(const control of form.elements)if(control.name&&draft[control.name]!==undefined)control.value=draft[control.name];chat.hidden=pos.value!=='1';const remember=()=>rememberInlineDraft(prompt,form,side);form.addEventListener('input',remember);form.addEventListener('change',remember);form.addEventListener('submit',saveInline);wrap.append(form);return wrap;}
+/* 把内联表单写回数据模型并记一条撤回。 */
+function applyInlineForm(form){
+  const side=form.dataset.side,draft=Object.fromEntries(new FormData(form)),prompt=byId(side).get(form.dataset.id);
+  if(!prompt)return null;
+  inlineDrafts.delete(prompt);contentHistory.delete(prompt);
+  if(isPendingPromptDraft(prompt,draft)){
+    pushUndo({type:'edit',side,id:prompt.identifier,before:clone(prompt),modifiedBefore:[...state.modified[side]]});
+    Object.assign(prompt,applyPromptDraft(prompt,draft));
+    state.modified[side].add(prompt.identifier);state.dirty[side]=true;rebuildCache();
+  }
+  return{side,id:prompt.identifier};
+}
+function saveInline(event){
+  event.preventDefault();
+  const r=applyInlineForm(event.currentTarget);
+  if(!r)return;
+  renderList('old');renderList('new');
+  // Keep both live forms intact: saving one side must not discard the other draft or move the viewport.
+  const head=document.querySelector('.pcm-compare-head'),title=head?.querySelector('h3');
+  if(tempLibrarySide){
+    syncTempLibrarySelection();
+    const current=byId(tempLibrarySide).get(tempLibrarySelection.promptId),item=state.freeSelect.enabled?tempLibrarySession.items.get(tempLibrarySelection.itemId):null;
+    if(title&&current){title.textContent=(item&&tempLibrarySide==='new'?item.name:current.name)||'未命名条目';const right=head.querySelector('.pcm-free-new-title');if(right&&item)right.textContent=(tempLibrarySide==='old'?item.name:current.name)||'未命名条目';}
+  }else if(!singleSide&&state.freeSelect.enabled){
+    const oldPrompt=byId('old').get(state.freeSelect.oldId),newPrompt=byId('new').get(state.freeSelect.newId);
+    if(title&&oldPrompt&&newPrompt){title.textContent=oldPrompt.name;const newer=head.querySelector('.pcm-free-new-title');if(newer)newer.textContent=newPrompt.name;}
+  }else{
+    const current=byId(state.activeSide||r.side).get(state.activeId)||byId(r.side).get(r.id),status=statusOf(r.id,r.side),badge=head?.querySelector('.pcm-badge');
+    if(title&&current)title.textContent=current.name||'(未命名)';
+    if(badge){badge.className='pcm-badge pcm-'+status;badge.textContent=statusText[status];}
+  }
+  pcmToastr.success((r.side==='old'?'旧版':'新版')+'条目已保存');
+}
+function updateSummary(side){const summary=document.querySelector('[data-summary="'+side+'"]'),preset=state[side];if(!summary||!preset)return;const counts={uncertain:0,changed:0,removed:0,added:0,same:0};ordered(side).forEach(p=>counts[statusOf(p.identifier,side)]++);setSummaryText(summary,preset.prompts.length+' 条 · 修改 '+counts.changed+' · '+(side==='old'?'新版删除 '+counts.removed:'新增 '+counts.added)+(counts.uncertain?' · 未确定 '+counts.uncertain:'')+(state.dirty[side]?' · 有未导出修改':''),side);renderMultiDelete(side);}
+function valueBox(title,value,large){const box=el('div','pcm-value');box.append(el('small','',title));if(large){const area=el('textarea');area.readOnly=true;area.value=valueText(value);box.append(area);}else box.append(el('pre','',valueText(value)));return box;}
+function selectField(labelText,name,value,options){const label=el('label','pcm-control');label.append(el('span','',labelText));const select=el('select');select.name=name;for(const optionData of options){const option=el('option','',optionData[1]);option.value=optionData[0];option.selected=String(value)===String(optionData[0]);select.append(option);}label.append(select);return label;}
+function editor(side,prompt){const form=el('form','pcm-editor');form.dataset.side=side;form.dataset.id=prompt.identifier;form.append(el('h3','', '编辑'+(side==='old'?'旧版':'新版')+'条目'));form.append(field('姓名','name',prompt.name),selectField('身份','role',prompt.role||'system',[['system','系统'],['user','用户'],['assistant','AI 助手']]),field('启用','enabled',prompt.enabled,'checkbox'));const triggerValue=Array.isArray(prompt.injection_trigger)&&prompt.injection_trigger.length?'all-explicit':'default';form.append(selectField('触发器','trigger_mode',triggerValue,[['default','所有类型（默认）'],['all-explicit','所有类型（明确指定）']]));form.append(selectField('位置','injection_position',prompt.injection_position??0,[['0','提示词管理器'],['1','聊天中']]));const chatFields=el('div','pcm-chat-fields');chatFields.dataset.chatFields='';chatFields.append(field('深度','injection_depth',prompt.injection_depth??4,'number'),field('顺序','injection_order',prompt.injection_order??100,'number'));if(prompt.injection_position!==1)chatFields.hidden=true;form.append(chatFields);const position=form.querySelector('[name=injection_position]');position.addEventListener('change',()=>{chatFields.hidden=position.value!=='1';});const contentLabel=el('label','pcm-editor-content');contentLabel.append(el('span','', '正文'));const content=el('textarea');content.name='content';content.value=prompt.content||'';contentLabel.append(content);form.append(contentLabel);const json=el('details','pcm-json');json.append(el('summary','', '完整条目 JSON'));const area=el('textarea');area.name='full_json';area.value=JSON.stringify(prompt,null,2);json.append(area);form.append(json);const save=btn('保存修改','save','pcm-primary',side);save.type='submit';form.append(save);form.addEventListener('submit',saveEdit);return form;}
+function field(labelText,name,value,type='text'){const label=el('label','pcm-control');label.append(el('span','',labelText));const input=el('input');input.name=name;input.type=type;if(type==='checkbox')input.checked=value!==false;else input.value=value??'';label.append(input);return label;}
+function saveEdit(event){event.preventDefault();const form=event.currentTarget,side=form.dataset.side,data=new FormData(form);try{let prompt=JSON.parse(String(data.get('full_json')));if(!prompt||typeof prompt!=='object'||Array.isArray(prompt))throw new Error('完整 JSON 必须是对象');prompt.identifier=form.dataset.id;prompt.name=String(data.get('name')||'');prompt.role=String(data.get('role')||'system');prompt.enabled=data.get('enabled')==='on';prompt.content=String(data.get('content')||'');prompt.injection_position=Number(data.get('injection_position'));prompt.injection_trigger=data.get('trigger_mode')==='all-explicit'?['normal','continue','impersonate','swipe','regenerate','quiet']:[];if(prompt.injection_position===1){prompt.injection_depth=Number(data.get('injection_depth')||4);prompt.injection_order=Number(data.get('injection_order')||100);}const previous=byId(side).get(prompt.identifier);pushUndo({type:'edit',side,id:prompt.identifier,before:clone(previous),modifiedBefore:[...state.modified[side]]});const index=state[side].prompts.findIndex(p=>p.identifier===prompt.identifier);state[side].prompts[index]=prompt;syncOrderEnabled(side,prompt.identifier,prompt.enabled);state.modified[side].add(prompt.identifier);state.dirty[side]=true;rebuildCache();renderList('old');renderList('new');renderCompare();pcmToastr.success('条目已保存');}catch(e){pcmToastr.error(e.message,'保存失败');}}
+function orderArray(preset){let entry=promptOrderEntry(preset);if(!entry){entry={character_id:100001,order:[]};if(!Array.isArray(preset.prompt_order))preset.prompt_order=[];preset.prompt_order.push(entry);}return entry.order||(entry.order=[]);}
+function syncOrderEnabled(side,id,enabled){const order=orderArray(state[side]),index=order.findIndex(x=>(typeof x==='string'?x:x?.identifier)===id);if(index<0)order.push({identifier:id,enabled});else if(typeof order[index]==='string')order[index]={identifier:id,enabled};else order[index].enabled=enabled;}
+// Overwrite copies only the body draft. Preset data and undo history change only on explicit save.
+function overwriteContentDraft(sourceSide,targetSide,id,targetId=id){
+  const detail=document.querySelector('[data-compare]');
+  const forms=[...(detail?.querySelectorAll('.pcm-inline-form')||[])];
+  const sourceForm=forms.find(form=>form.dataset.side===sourceSide&&form.dataset.id===id);
+  const targetForm=forms.find(form=>form.dataset.side===targetSide&&form.dataset.id===targetId);
+  const sourceArea=sourceForm?.querySelector('[name=content]'),targetArea=targetForm?.querySelector('[name=content]');
+  if(!sourceArea||!targetArea)return;
+  targetArea.value=sourceArea.value;
+  targetArea.scrollTop=0;targetArea.scrollLeft=0;
+  const backdrop=targetArea.previousElementSibling;
+  if(backdrop){backdrop.scrollTop=0;backdrop.scrollLeft=0;}
+  targetArea.dispatchEvent(new Event('input',{bubbles:true}));
+  targetArea.dispatchEvent(new Event('change',{bubbles:true}));
+  pcmToastr.info('正文已覆盖，尚未保存；请点击「保存'+(targetSide==='old'?'旧版':'新版')+'条目」');
+}
+function migrate(sourceSide){
+  const targetSide=sourceSide==='old'?'new':'old',target=state[targetSide],pair=pairFor(state.activeId);
+  const {old,new:newer}=comparisonPrompts(state.activeId),prompt=sourceSide==='old'?old:newer,other=sourceSide==='old'?newer:old;
+  if(!target||!prompt||pair?.status==='uncertain')return;
+  if(other){overwriteContentDraft(sourceSide,targetSide,prompt.identifier,other.identifier);return;}
+  const orderedIds=ordered(sourceSide).map(p=>p.identifier),at=orderedIds.indexOf(prompt.identifier);
+  const mapId=id=>counterpartId(sourceSide,id);
+  const left=orderedIds.slice(0,at).reverse().map(mapId).find(Boolean),right=orderedIds.slice(at+1).map(mapId).find(Boolean);
+  const gap=(items,idOf)=>{const prev=left?items.findIndex(x=>idOf(x)===left):-1,next=right?items.findIndex(x=>idOf(x)===right):-1;return prev>=0?prev+1:next>=0?next:items.length;};
+  const copy=clone(prompt);while(byId(targetSide).has(copy.identifier))copy.identifier=createIdentifier();
+  pushUndo(moveSnapshot(targetSide));target.prompts.splice(gap(target.prompts,p=>p.identifier),0,copy);
+  const order=orderArray(target);order.splice(gap(order,x=>typeof x==='string'?x:x.identifier),0,{identifier:copy.identifier,enabled:promptEnabled(sourceSide,prompt)});
+  state.dirty[targetSide]=true;rebuildCache();renderAll();pcmToastr.success('条目已迁移到'+(targetSide==='old'?'旧版':'新版')+'的对应位置');
+}
+const exportingPresets = new Set();
+async function exportPreset(side) {
+  const preset = state[side];
+  if (!preset || exportingPresets.has(side)) return;
+  exportingPresets.add(side);
+  const button = document.querySelector('[data-action="export"][data-side="'+side+'"]');
+  if (button) button.disabled = true;
+  try {
+    const originalName = state[side+'Name'], snapshot = JSON.stringify(preset);
+    const name = (originalName || side+'-preset').replace(/\.json$/i, '')+'-已编辑.json';
+    const result = await host.request('export-preset', {name, preset: JSON.parse(snapshot), tavernSource: state.tavernSource[side] || null});
+    if (result?.status === 'cancelled') {pcmToast('已取消导出，编辑内容已保留', 'info'); return;}
+    if (result?.status !== 'saved' && result?.status !== 'started') throw new Error('酒馆未返回有效的导出状态');
+    if (result.status === 'saved') {
+      const lineage=getTextReplaceLineage(preset);
+      lineage.savedRevision++;
+      if(state[side]&&getTextReplaceLineage(state[side])===lineage){
+        // 导出等待期间也可能撤回；只有当前草稿仍等于已保存快照才可清除修改标记。
+        state.dirty[side]=state[side+'Name']!==originalName||JSON.stringify(state[side])!==snapshot;
+        updateSummary(side);
+      }
+    }
+    pcmToast(result.status === 'saved' ? '预设文件已导出' : '已发起导出，请在下载目录或系统保存窗口确认文件；编辑内容已保留', 'success');
+  } catch (error) {
+    console.error('[preset-compare-migrator] export failed', error);
+    pcmToast('导出未完成：'+error.message+'。编辑内容已保留，请确认下载状态后再重试', 'error');
+  } finally {
+    exportingPresets.delete(side);
+    if (button) button.disabled = false;
+  }
+}
+function rowById(list,id){if(!list)return null;return[...list.querySelectorAll('.pcm-row')].find(row=>row.dataset.dragId===id)||null;}
+function updateRowOperationTags(row,side,id){if(!row)return;let tags=row.querySelector('.pcm-operation-tags');if(!tags){tags=el('span','pcm-operation-tags');row.querySelector('.pcm-row-title')?.append(tags);}tags.querySelectorAll('.pcm-op-tag').forEach(t=>t.remove());if(state.dragged[side].has(id))tags.append(el('span','pcm-op-tag pcm-op-dragged','已拖拽'));if(state.modified[side].has(id))tags.append(el('span','pcm-op-tag pcm-op-modified','已修改'));}
+function updateRowBadge(row,id,side){if(!row)return;const status=statusOf(id,side),badge=row.querySelector('.pcm-badge');if(badge){badge.className='pcm-badge pcm-'+status;badge.textContent=badgeText(id,side);}}
+function getBaiBaiGroupState(preset){const value=preset?.extensions?.baibaiToolkit?.presetPromptGroups;return value&&typeof value==='object'?value:null;}function ensureBaiBaiGroupState(preset){preset.extensions=preset.extensions&&typeof preset.extensions==='object'?preset.extensions:{};preset.extensions.baibaiToolkit=preset.extensions.baibaiToolkit&&typeof preset.extensions.baibaiToolkit==='object'?preset.extensions.baibaiToolkit:{};let value=preset.extensions.baibaiToolkit.presetPromptGroups;if(!value||typeof value!=='object')value=preset.extensions.baibaiToolkit.presetPromptGroups={groups:[],prompts:{}};if(!Array.isArray(value.groups))value.groups=[];if(!value.prompts||typeof value.prompts!=='object')value.prompts={};return value;}function syncBaiBaiGroupAfterMove(sourceSide,targetSide,id,beforeId,sourcePromptId=id){if(sourceSide===targetSide)return;const sourceGroup=getBaiBaiGroupState(state[sourceSide]),targetGroup=getBaiBaiGroupState(state[targetSide]);if(!sourceGroup&&!targetGroup)return;const groupState=ensureBaiBaiGroupState(state[targetSide]),orderedIds=state.cache.ordered[targetSide].map(p=>p.identifier),index=beforeId?orderedIds.indexOf(beforeId):orderedIds.length,nextId=index>=0&&index<orderedIds.length?orderedIds[index]:null,prevId=index>0?orderedIds[index-1]:null;const nextGroup=nextId?groupState.prompts?.[nextId]?.groupId:null,prevGroup=prevId?groupState.prompts?.[prevId]?.groupId:null,sourceId=sourceGroup?.prompts?.[sourcePromptId]?.groupId,validGroups=new Set((groupState.groups||[]).map(g=>String(g.id)));const candidate=[nextGroup,prevGroup,sourceId].find(groupId=>groupId&&validGroups.has(String(groupId)));if(candidate)groupState.prompts[id]={groupId:String(candidate)};else delete groupState.prompts[id];}
+
+function prepareGroupDrag(side,groupId){
+ if(state.grouping.side||!state[side])return null;
+ return {side,groupId,old:state.old,new:state.new,baseline:{old:JSON.stringify(state.old),new:JSON.stringify(state.new)}};
+}
+function resolveGroupDrop(data,side,section,after){
+ if(!state[side])return null;
+ if(side===data.side&&section?.dataset.groupId===data.groupId)return null;
+ const items=ordered(side).filter(p=>isInjected(side,p)),meta=getBaiBaiGroupState(state[side]);
+ let beforeId=null;
+ if(section){
+  const gid=section.dataset.groupId;
+  const members=gid?items.filter(p=>String(meta?.prompts?.[p.identifier]?.groupId)===gid):[...section.querySelectorAll('.pcm-row')].map(row=>byId(side).get(row.dataset.dragId)).filter(Boolean);
+  if(!members.length)return null;
+  beforeId=after?(items[items.findIndex(p=>p.identifier===members.at(-1).identifier)+1]?.identifier||null):members[0].identifier;
+ }
+ // Reject an interleaved legacy group boundary instead of splitting an existing group.
+ const ids=new Set(state[data.side].prompts.filter(p=>String(getBaiBaiGroupState(state[data.side])?.prompts?.[p.identifier]?.groupId)===data.groupId).map(p=>p.identifier));
+ const remaining=data.side===side?items.filter(p=>!ids.has(p.identifier)):items;
+ let index=beforeId===null?remaining.length:remaining.findIndex(p=>p.identifier===beforeId);
+ if(index<0){const originalIndex=items.findIndex(p=>p.identifier===beforeId);beforeId=items.slice(originalIndex).find(p=>remaining.includes(p))?.identifier||null;index=beforeId===null?remaining.length:remaining.findIndex(p=>p.identifier===beforeId);}
+ const known=new Set((meta?.groups||[]).map(g=>String(g.id))),gid=p=>{const g=String(meta?.prompts?.[p.identifier]?.groupId);return known.has(g)?g:null;};
+ const left=new Set(remaining.slice(0,index).map(gid).filter(Boolean));if(remaining.slice(index).some(p=>left.has(gid(p))))return null;
+ return {side,beforeId};
+}
+function commitGroupDrop(data,target){
+ if(['old','new'].some(side=>state[side]!==data[side]||JSON.stringify(state[side])!==data.baseline[side])){pcmToastr.warning('预设已变化，请重新拖拽');return;}
+ try{
+  const next=transferPresetGroup(state[data.side],state[target.side],data.groupId,target.beforeId,{overwriteSameIdOnDrop:editorPreferences.overwriteSameIdOnDrop});
+  if(equalValues(next,state[target.side]))return;
+  pushUndo(moveSnapshot(target.side));textReplaceLineages.set(next,getTextReplaceLineage(state[target.side]));state[target.side]=next;
+  if(data.side!==target.side){const previousGroups=new Set((getBaiBaiGroupState(data[target.side])?.groups||[]).map(g=>g.id));const newGroup=getBaiBaiGroupState(next).groups.find(g=>!previousGroups.has(g.id));for(const p of next.prompts)if(getBaiBaiGroupState(next).prompts?.[p.identifier]?.groupId===newGroup.id)state.dragged[target.side].add(p.identifier);state.groupCollapsed['g:'+target.side+':'+newGroup.id]=!!state.groupCollapsed['g:'+data.side+':'+data.groupId];}
+
+  state.dirty[target.side]=true;state.activeId=null;state.activeSide=null;hideCompare();rebuildCache();renderAll();pcmToastr.success(data.side===target.side?'分组已排序':'分组已迁移，来源保留');
+ }catch(error){pcmToastr.warning(error.message||'整组拖拽未完成');}
+}
+function movePrompt(sourceSide,targetSide,id,beforeId,quiet,skipUndo,resolution){
+  const source=state[sourceSide],target=state[targetSide],prompt=byId(sourceSide).get(id);
+  if(!source||!target||!prompt)return;
+  // Read the visible/effective switch before mutating either ordering cache.
+  // Imported prompt.enabled can disagree with the active prompt_order node.
+  const enabled=promptEnabled(sourceSide,prompt);
+  const plan=sourceSide!==targetSide?(resolution?new Map([[id,resolution]]):planDroppedPrompts(sourceSide,targetSide,[id])):null;
+  if(!skipUndo)pushUndo(moveSnapshot(targetSide));
+  const targetOrdered=state.cache.ordered[targetSide];
+  const sourcePromptId=id;
+  const planned=plan?.get(id);
+  if(planned)id=planned.prompt.identifier;
+  const existing=targetOrdered.findIndex(p=>p.identifier===id);
+  let index=beforeId?targetOrdered.findIndex(p=>p.identifier===beforeId):targetOrdered.length;
+  if(existing>=0){if(index>existing)index--;targetOrdered.splice(existing,1);}
+  if(index<0||index>targetOrdered.length)index=targetOrdered.length;
+  const copy=sourceSide===targetSide?prompt:planned.prompt;
+  // Do not mutate same-side prompt objects: undo snapshots retain references.
+  if(sourceSide!==targetSide){copy.enabled=enabled;copy.identifier=id;}
+  targetOrdered.splice(index,0,copy);target.prompts=targetOrdered.slice();state.cache.maps[targetSide].set(id,copy);
+  const rawOrder=orderArray(target),entryHost=promptOrderEntry(target),xidOf=x=>typeof x==='string'?x:x?.identifier,clean=rawOrder.filter(x=>xidOf(x)!==id);
+  let oi=beforeId?clean.findIndex(x=>xidOf(x)===beforeId):clean.length;
+  if(oi<0&&beforeId===id){const self=rawOrder.findIndex(x=>xidOf(x)===id);if(self>=0)oi=self;}
+  if(oi<0)oi=clean.length;
+  clean.splice(oi,0,{identifier:id,enabled});(entryHost||target.prompt_order[0]).order=clean;
+  syncBaiBaiGroupAfterMove(sourceSide,targetSide,id,beforeId,sourcePromptId);
+  if(sourceSide!==targetSide)state.dragged[targetSide].add(id);
+  state.dirty[targetSide]=true;state.activeId=null;state.activeSide=null;hideCompare();rebuildCache();renderList(sourceSide);
+  if(targetSide!==sourceSide)renderList(targetSide);
+  if(!quiet)notifyDroppedPrompts(plan,'条目已放置到目标位置');
+  return id;
+}
+let outerScrollTouch=null;function isOuterScrollSurface(target){if(!target||typeof target.closest!=='function')return false;/* 预设列表和所有浮层拥有独立滚动：其手势不得转交给外层对比页。 */if(target.closest('.pcm-migration-modal,.pcm-replace-panel,.pcm-ai-stitch,[data-temp-library],.pcm-list,.pcm-picker,.pcm-pane-resizer,.pcm-wb-list,.pcm-wb-modal,.pcm-wb-select-menu'))return false;if(target.closest('button,input,select,textarea,label,a'))return false;return Boolean(target.closest('.pcm-dialog,.pcm-app,.pcm-header,.pcm-lists,.pcm-pane,.pcm-pane-head,.pcm-tools,.pcm-summary'));}function onOuterScrollTouchStart(event){if(!isOuterScrollSurface(event.target)||event.touches.length!==1)return;const point=event.touches[0],dialog=document.getElementById(APP_ID+'-dialog');outerScrollTouch={dialog,lastY:point.clientY,startY:point.clientY,moved:false};}function onOuterScrollTouchMove(event){if(!outerScrollTouch||event.touches.length!==1)return;if(touchDrag?.holding||regexDrag?.holding){outerScrollTouch=null;return;}const point=event.touches[0],delta=outerScrollTouch.lastY-point.clientY,dialog=outerScrollTouch.dialog,maxScroll=Math.max(0,dialog.scrollHeight-dialog.clientHeight),canMoveOuter=delta>0?dialog.scrollTop<maxScroll:delta<0?dialog.scrollTop>0:false;if(!canMoveOuter)return;if(!outerScrollTouch.moved&&Math.abs(point.clientY-outerScrollTouch.startY)<4)return;outerScrollTouch.moved=true;outerScrollTouch.lastY=point.clientY;event.preventDefault();event.stopPropagation();dialog.scrollTop=Math.max(0,Math.min(maxScroll,dialog.scrollTop+delta));}function onOuterScrollTouchEnd(){outerScrollTouch=null;}
+// 普通预设条目是拖动区域：长按菜单可能早于拖动计时器触发，不能依赖 holding。
+// 仅拦截真实列表条目，正文编辑、搜索输入与迁移预览保留各自的原生菜单行为。
+function onRowContextMenu(event){
+  const target=event.target instanceof Element?event.target:event.target?.parentElement;
+  if(!target?.closest('.pcm-list[data-list] .pcm-row[data-drag-id][data-drag-side]'))return;
+  if(target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])'))return;
+  event.preventDefault();
+}
+let touchDrag=null,touchContacts=0;
+/* 拖拽自动滚动（Windows 文件管理器风格，触屏长按/桌面HTML5拖拽共用一套 rAF 循环）：指针进入某列表上/下边缘区并连续停留
+   AUTOSCROLL_DWELL_MS 毫秒后才持续滚动该列表（快速划过/跨面板水平移动经过边缘不足该时长，不会误触发），越靠近边缘越快、
+   激活后 250ms 内渐进加速不猛冲、滚到边界自停、松手/离边即停。停留计时按「哪个列表+上/下边缘」区分，划出该区自动重置。 */
+let dragAutoScrollRaf=0,html5DragPointer=null,edgeKey='',edgeSince=0;
+const AUTOSCROLL_DWELL_MS=450,AUTOSCROLL_MAX_STEP=10,AUTOSCROLL_ZONE=64,AUTOSCROLL_SLACK=4;
+function startDragAutoScroll(){if(dragAutoScrollRaf)return;edgeKey='';edgeSince=0;const tick=()=>{dragAutoScrollStep();dragAutoScrollRaf=requestAnimationFrame(tick);};dragAutoScrollRaf=requestAnimationFrame(tick);}
+function stopDragAutoScroll(){if(dragAutoScrollRaf){cancelAnimationFrame(dragAutoScrollRaf);dragAutoScrollRaf=0;}html5DragPointer=null;edgeKey='';edgeSince=0;}
+function dragAutoScrollStep(){const now=performance.now();let x,y,holdingDrag=null;if(touchDrag&&touchDrag.holding&&touchDrag.my!==undefined){x=touchDrag.mx;y=touchDrag.my;holdingDrag=touchDrag;}else if(pointerDrag&&pointerDrag.holding&&pointerDrag.my!==undefined){x=pointerDrag.mx;y=pointerDrag.my;holdingDrag=pointerDrag;}else if(html5DragPointer){if(html5DragPointer.t===undefined||now-html5DragPointer.t>500)return;x=html5DragPointer.x;y=html5DragPointer.y;}else return;const e=dragAutoScrollEdge(x,y),key=e?(e.list.dataset.list+':'+e.dir):'';if(key!==edgeKey){edgeKey=key;edgeSince=now;}if(!e)return;const dwell=now-edgeSince;if(dwell<AUTOSCROLL_DWELL_MS)return;const ramp=Math.min(1,(dwell-AUTOSCROLL_DWELL_MS)/250),before=e.list.scrollTop;e.list.scrollTop=before+Math.ceil(e.delta*Math.max(ramp,0.34));if(e.list.scrollTop!==before&&holdingDrag)processDragAt(holdingDrag);}
+function dragAutoScrollEdge(x,y){for(const list of document.querySelectorAll('.pcm-list')){const r=list.getBoundingClientRect();if(x<r.left||x>r.right)continue;if(y<r.top-AUTOSCROLL_SLACK||y>r.bottom+AUTOSCROLL_SLACK)continue;const zone=Math.min(AUTOSCROLL_ZONE,Math.max(36,r.height*0.22));if(y<r.top+zone)return{list,dir:'up',delta:-Math.max(2,Math.ceil((r.top+zone-y)/zone*AUTOSCROLL_MAX_STEP))};if(y>r.bottom-zone)return{list,dir:'down',delta:Math.max(2,Math.ceil((y-(r.bottom-zone))/zone*AUTOSCROLL_MAX_STEP))};}return null;}function onTouchContactChange(event){touchContacts=event.touches.length;}
+function touchById(event,id){for(const t of event.touches)if(t.identifier===id)return t;return null;}function touchEnded(event,id){for(const t of event.changedTouches)if(t.identifier===id)return true;return false;}function cleanupTouchDrag(){if(!touchDrag)return;clearTimeout(touchDrag.timer);if(touchDrag.raf)cancelAnimationFrame(touchDrag.raf);const wasHolding=touchDrag.holding;touchDrag.row.classList.remove('pcm-dragging');touchDrag.dialog?.classList.remove('pcm-touch-dragging');clearDropMarker();stopDragAutoScroll();touchDrag=null;if(wasHolding)pcmUnlock();}function onTouchStart(event){const row=event.target.closest('.pcm-row');if(!row)return;if(touchDrag||event.touches.length!==1)return;const point=event.touches[0],dialog=row.closest('.pcm-dialog');touchDrag={id:point.identifier,row,dialog,timer:setTimeout(()=>{if(!touchDrag)return;touchDrag.holding=true;row.classList.add('pcm-dragging');dialog?.classList.add('pcm-touch-dragging');pcmLock();startDragAutoScroll();touchDrag.scrollHome={};document.querySelectorAll('.pcm-list').forEach(l=>{touchDrag.scrollHome[l.dataset.list]=l.scrollTop;});},450),x:point.clientX,y:point.clientY,holding:false,targetSide:null,beforeId:null,targetGroupId:null};}function onTouchMove(event){if(!touchDrag)return;const point=touchById(event,touchDrag.id);if(!point)return;if(!touchDrag.holding){if(Math.abs(point.clientX-touchDrag.x)>8||Math.abs(point.clientY-touchDrag.y)>8){clearTimeout(touchDrag.timer);touchDrag=null;}return;}event.preventDefault();touchDrag.mx=point.clientX;touchDrag.my=point.clientY;if(!touchDrag.raf)touchDrag.raf=requestAnimationFrame(()=>{if(touchDrag)touchDrag.raf=null;processTouchDrag();});}function processTouchDrag(){processDragAt(touchDrag);}function processPointerDrag(){processDragAt(pointerDrag);}function nearestRowTo(list,y,excludeRow){let best=null,bestD=Infinity;for(const r of list.querySelectorAll('.pcm-row')){if(r===excludeRow)continue;const rect=r.getBoundingClientRect();if(rect.height===0)continue;const d=y<rect.top?rect.top-y:(y>rect.bottom?y-rect.bottom:0);if(d<bestD){bestD=d;best=r;}}return best;}
+function processDragAt(drag){if(!drag||!drag.holding||drag.mx===undefined||drag.my===undefined)return;drag.groupAssign=false;
+  /* Dead zone: long-press released nearly in place clears the drop target so nothing moves. */
+  if(Math.abs(drag.my-drag.y)<12&&Math.abs(drag.mx-drag.x)<12){clearDropMarker();drag.beforeId=null;drag.targetSide=null;drag.targetGroupId=null;return;}
+  drag.suppressClick=true;
+  const hit=document.elementFromPoint(drag.mx,drag.my),list=hit?.closest('.pcm-list'),row=hit?.closest('.pcm-row'),moving=dragIdsFor(drag.row),movingIds=list?.dataset.list===drag.row.dataset.dragSide?(moving?moving.ids:drag.row.dataset.dragId):null;if(!list){clearDropMarker();drag.beforeId=null;drag.targetSide=null;drag.targetGroupId=null;return;}if(row&&row!==drag.row){drag.beforeId=markDropTarget(row,{clientY:drag.my},movingIds);if(list.dataset.list===drag.row.dataset.dragSide&&drag.beforeId===drag.row.dataset.dragId)drag.beforeId=nextOrderedRowId(drag.row,movingIds);drag.targetSide=list.dataset.list;drag.targetGroupId=groupIdForRow(row);}else if(!row){const group=hit.closest('.pcm-group:not(.pcm-uninjected)');if(group){const rows=group.querySelectorAll('.pcm-group-body .pcm-row'),lastRow=rows[rows.length-1];clearDropMarker();group.classList.add('pcm-group-drop');dropEndList=group;drag.beforeId=lastRow?nextOrderedRowId(lastRow,movingIds):nextRenderedRowId(group);if(list.dataset.list===drag.row.dataset.dragSide&&drag.beforeId===drag.row.dataset.dragId)drag.beforeId=nextOrderedRowId(drag.row,movingIds);drag.targetSide=list.dataset.list;drag.targetGroupId=group.dataset.groupId||null;drag.groupAssign=!!(group.dataset.groupId&&!lastRow);}else{const near=nearestRowTo(list,drag.my,drag.row);if(near){drag.beforeId=markDropTarget(near,{clientY:drag.my},movingIds);if(list.dataset.list===drag.row.dataset.dragSide&&drag.beforeId===drag.row.dataset.dragId)drag.beforeId=nextOrderedRowId(drag.row,movingIds);drag.targetSide=list.dataset.list;drag.targetGroupId=groupIdForRow(near);}else{clearDropMarker();list.classList.add('pcm-drop-end');dropEndList=list;drag.beforeId=null;drag.targetSide=list.dataset.list;drag.targetGroupId=null;}}}else{clearDropMarker();drag.beforeId=null;drag.targetSide=null;drag.targetGroupId=null;}}function onTouchEnd(event){if(!touchDrag)return;if(!touchEnded(event,touchDrag.id))return;clearTimeout(touchDrag.timer);if(touchDrag.raf)cancelAnimationFrame(touchDrag.raf);if(touchDrag.holding){for(const t of event.changedTouches)if(t.identifier===touchDrag.id){touchDrag.mx=t.clientX;touchDrag.my=t.clientY;break;}try{processTouchDrag();}catch(_){}}const drag=touchDrag;touchDrag=null;drag.row.classList.remove('pcm-dragging');const jitter=drag.mx===undefined||drag.my===undefined||(Math.abs(drag.my-drag.y)<12&&Math.abs(drag.mx-drag.x)<12);try{if(drag.holding&&drag.targetSide&&!jitter){event.preventDefault();const srcSide=drag.row.dataset.dragSide;const msIds=dragIdsFor(drag.row);if(drag.groupAssign){const ids=msIds?msIds.ids:[drag.row.dataset.dragId];if(ids.length>1)assignPromptsToGroup(srcSide,drag.targetSide,ids,drag.targetGroupId);else assignPromptToGroup(srcSide,drag.targetSide,ids[0],drag.targetGroupId);}else{placeDroppedPrompts(srcSide,drag.targetSide,msIds?msIds.ids:[drag.row.dataset.dragId],drag.beforeId,drag.targetGroupId);}if(srcSide!==drag.targetSide&&drag.scrollHome){const srcList=document.querySelector('[data-list="'+srcSide+'"]');if(srcList&&drag.scrollHome[srcSide]!==undefined)srcList.scrollTop=drag.scrollHome[srcSide];}}}catch(error){console.error('[preset-compare-migrator] touch drop failed',error);}clearDropMarker();stopDragAutoScroll();drag.dialog?.classList.remove('pcm-touch-dragging');if(drag.holding)pcmUnlock();}function onTouchCancel(event){if(!touchDrag||!touchEnded(event,touchDrag.id))return;cleanupTouchDrag();}
+/* 指针长按拖拽（桌面/混合设备）：触屏长按由 onTouchStart 系处理，这里只接管非 touch 指针（鼠标/触控笔），
+   解决 TauriTavern/Windows 端 HTML5 拖拽（dragstart）不触发、条目无法长按拖动的问题。
+   按住 320ms 进入拖拽（holding），之后复用 processDragAt 的命中/落点逻辑；未达长按的移动/抬起不拦截，点击展开不受影响。 */
+let pointerDrag=null,suppressClickUntil=0;
+function cleanupPointerDrag(){if(!pointerDrag)return;clearTimeout(pointerDrag.timer);if(pointerDrag.raf)cancelAnimationFrame(pointerDrag.raf);const wasHolding=pointerDrag.holding;pointerDrag.row.classList.remove('pcm-dragging');pointerDrag.dialog?.classList.remove('pcm-touch-dragging');clearDropMarker();stopDragAutoScroll();pointerDrag=null;if(wasHolding)pcmUnlock();}
+function beginPointerHold(){if(!pointerDrag||pointerDrag.holding)return;pointerDrag.holding=true;pointerDrag.row.classList.add('pcm-dragging');pointerDrag.dialog?.classList.add('pcm-touch-dragging');pcmLock();startDragAutoScroll();pointerDrag.scrollHome={};document.querySelectorAll('.pcm-list').forEach(l=>{pointerDrag.scrollHome[l.dataset.list]=l.scrollTop;});}function onRowPointerDown(event){if(event.pointerType==='touch')return;if(touchDrag)return;if(event.button!==undefined&&event.button!==0)return;if(pointerDrag)cleanupPointerDrag();const row=event.target.closest?.('.pcm-row');if(!row)return;const dialog=row.closest('.pcm-dialog');pointerDrag={id:event.pointerId,row,dialog,timer:setTimeout(beginPointerHold,320),x:event.clientX,y:event.clientY,holding:false};}
+function onRowPointerMove(event){if(!pointerDrag||event.pointerId!==pointerDrag.id)return;if(!pointerDrag.holding){if(Math.abs(event.clientX-pointerDrag.x)>4||Math.abs(event.clientY-pointerDrag.y)>4){pointerDrag.mx=event.clientX;pointerDrag.my=event.clientY;beginPointerHold();}return;}event.preventDefault();pointerDrag.mx=event.clientX;pointerDrag.my=event.clientY;if(!pointerDrag.raf)pointerDrag.raf=requestAnimationFrame(()=>{if(pointerDrag)pointerDrag.raf=null;processPointerDrag();});}
+function onRowPointerUp(event){if(!pointerDrag||event.pointerId!==pointerDrag.id)return;clearTimeout(pointerDrag.timer);if(pointerDrag.raf)cancelAnimationFrame(pointerDrag.raf);if(pointerDrag.holding){pointerDrag.mx=event.clientX;pointerDrag.my=event.clientY;try{processPointerDrag();}catch(_){}}const drag=pointerDrag;pointerDrag=null;if(drag.holding&&drag.suppressClick)suppressClickUntil=performance.now()+400;drag.row.classList.remove('pcm-dragging');const jitter=drag.mx===undefined||drag.my===undefined||(Math.abs(drag.my-drag.y)<12&&Math.abs(drag.mx-drag.x)<12);try{if(drag.holding&&drag.targetSide&&!jitter){const srcSide=drag.row.dataset.dragSide;const msIds=dragIdsFor(drag.row);if(drag.groupAssign){const ids=msIds?msIds.ids:[drag.row.dataset.dragId];if(ids.length>1)assignPromptsToGroup(srcSide,drag.targetSide,ids,drag.targetGroupId);else assignPromptToGroup(srcSide,drag.targetSide,ids[0],drag.targetGroupId);}else{placeDroppedPrompts(srcSide,drag.targetSide,msIds?msIds.ids:[drag.row.dataset.dragId],drag.beforeId,drag.targetGroupId);}if(srcSide!==drag.targetSide&&drag.scrollHome){const srcList=document.querySelector('[data-list="'+srcSide+'"]');if(srcList&&drag.scrollHome[srcSide]!==undefined)srcList.scrollTop=drag.scrollHome[srcSide];}}}catch(error){console.error('[preset-compare-migrator] pointer drop failed',error);}clearDropMarker();stopDragAutoScroll();drag.dialog?.classList.remove('pcm-touch-dragging');if(drag.holding)pcmUnlock();}
+function onRowPointerCancel(event){if(!pointerDrag||event.pointerId!==pointerDrag.id)return;cleanupPointerDrag();}
+let dropMarker=null,dropClass='',dropEndList=null;function clearDropMarker(){if(dropMarker&&dropClass)dropMarker.classList.remove(dropClass);if(dropEndList){dropEndList.classList.remove('pcm-drop-end');dropEndList.classList.remove('pcm-group-drop');}dropMarker=null;dropClass='';dropEndList=null;}function nextRenderedRowId(row){const direct=row.nextElementSibling;if(direct?.matches('.pcm-row'))return direct.dataset.dragId;let sibling=row.closest('.pcm-group')?.nextElementSibling||direct;while(sibling){if(sibling.matches?.('.pcm-row'))return sibling.dataset.dragId;const nested=sibling.querySelector?.('.pcm-row');if(nested)return nested.dataset.dragId;sibling=sibling.nextElementSibling;}return null;}function nextOrderedRowId(row,excludedIds){const side=row?.dataset?.dragSide,id=row?.dataset?.dragId,items=state.cache.ordered[side]||[],index=items.findIndex(prompt=>prompt.identifier===id),excluded=new Set(Array.isArray(excludedIds)?excludedIds:[excludedIds].filter(Boolean));for(let i=index+1;i<items.length;i++)if(!excluded.has(items[i].identifier))return items[i].identifier;return null;}function markDropTarget(row,event,excludedIds){const rect=row.getBoundingClientRect(),after=event.clientY>rect.top+rect.height/2,nextClass=after?'pcm-drop-after':'pcm-drop-before';if(dropMarker!==row||dropClass!==nextClass){clearDropMarker();row.classList.add(nextClass);dropMarker=row;dropClass=nextClass;}return after?nextOrderedRowId(row,excludedIds):row.dataset.dragId;}function onDragStart(event){if(touchContacts>0||pointerDrag){if(pointerDrag)cleanupPointerDrag();event.preventDefault();return;}const row=event.target.closest('.pcm-row');if(!row)return;event.dataTransfer.effectAllowed='move';const ms=dragIdsFor(row);event.dataTransfer.setData('text/plain',JSON.stringify(ms?{id:row.dataset.dragId,side:row.dataset.dragSide,ids:ms.ids}:{id:row.dataset.dragId,side:row.dataset.dragSide}));row.classList.add('pcm-dragging');pcmLock();html5DragLock=true;startDragAutoScroll();}function groupIdForRow(row){const group=row?.closest('.pcm-group');return group?.dataset.groupId||null;}
+function applyDropGroup(side,id,groupId){const groupState=getBaiBaiGroupState(state[side]);if(!groupState&&!groupId)return;const ensured=ensureBaiBaiGroupState(state[side]);if(groupId)ensured.prompts[id]={groupId:String(groupId)};else delete ensured.prompts[id];}
+function onDragOver(event){html5DragPointer={x:event.clientX,y:event.clientY,t:performance.now()};const list=event.target.closest('.pcm-list');if(!list)return;event.preventDefault();const row=event.target.closest('.pcm-row');if(row){markDropTarget(row,event);return;}const groupHead=event.target.closest('.pcm-group-head'),group=groupHead?.closest('.pcm-group');if(group?.dataset.groupId){clearDropMarker();group.classList.add('pcm-group-drop');dropEndList=group;return;}if(dropEndList!==list){clearDropMarker();list.classList.add('pcm-drop-end');dropEndList=list;}}function onDrop(event){stopDragAutoScroll();const list=event.target.closest('.pcm-list');if(!list)return;event.preventDefault();const row=event.target.closest('.pcm-row');if(row){try{const data=JSON.parse(event.dataTransfer.getData('text/plain')),beforeId=markDropTarget(row,event,data.side===list.dataset.list?(data.ids&&data.ids.length?data.ids:data.id):null),targetSide=list.dataset.list,targetGroupId=groupIdForRow(row);clearDropMarker();placeDroppedPrompts(data.side,targetSide,data.ids&&data.ids.length>1?data.ids:[data.id],beforeId,targetGroupId);}catch{clearDropMarker();}return;}const groupHead=event.target.closest('.pcm-group-head'),group=groupHead?.closest('.pcm-group');if(group?.dataset.groupId){try{const data=JSON.parse(event.dataTransfer.getData('text/plain'));group.classList.remove('pcm-group-drop');const ids=data.ids&&data.ids.length>1?data.ids:[data.id];if(ids.length>1)assignPromptsToGroup(data.side,group.dataset.groupSide,ids,group.dataset.groupId);else assignPromptToGroup(data.side,group.dataset.groupSide,ids[0],group.dataset.groupId);}catch{}clearDropMarker();return;}try{const data=JSON.parse(event.dataTransfer.getData('text/plain'));clearDropMarker();if(data.ids&&data.ids.length>1)movePrompts(data.side,list.dataset.list,data.ids,null);else movePrompt(data.side,list.dataset.list,data.id,null);}catch{clearDropMarker();}}
+function onDragEnd(event){if(event.target instanceof Element)event.target.closest('.pcm-row')?.classList.remove('pcm-dragging');clearDropMarker();stopDragAutoScroll();if(html5DragLock){html5DragLock=false;pcmUnlock();}}
+async function tavernPresetCandidates(){try{return new Map(await host.request('list-presets'));}catch(error){console.warn('[preset-compare-migrator] Failed to read host presets',error);return new Map();}}
+function renderTavernPresetPicker(picker){
+  const list=picker.querySelector('[data-picker-list]');
+  const query=picker.querySelector('[data-preset-search]').value.trim().toLocaleLowerCase();
+  list.replaceChildren();
+  for(const [name,preset] of tavernPresetPickerData){
+    if(query&&!name.toLocaleLowerCase().includes(query))continue;
+    const item=btn(name,'choose-tavern','pcm-picker-item');item.dataset.presetName=name;
+    item.append(el('small','',preset.prompts.length+' 个条目'));list.append(item);
+  }
+  if(!list.childElementCount){const empty=el('p','pcm-preset-search-empty','没有找到匹配的预设');empty.setAttribute('role','status');list.append(empty);}
+  list.scrollTop=0;
+}
+async function pullTavernPreset(){
+  const candidates=await tavernPresetCandidates();
+  if(!candidates.size){pcmToastr.warning('未能读取 Chat Completion/OpenAI 预设。','未找到酒馆预设');return;}
+  tavernPresetPickerData=candidates;
+  let picker=document.querySelector('[data-tavern-picker]');
+  if(!picker){
+    picker=el('section','pcm-picker');picker.dataset.tavernPicker='';
+    const panel=el('div','pcm-picker-panel'),head=el('header','pcm-picker-head');
+    head.append(el('h3','', '选择酒馆预设'),btn('×','close-picker','pcm-collapse'));panel.append(head);
+    const searchRow=el('div','pcm-preset-search'),search=el('input','text_pole');
+    search.type='search';search.placeholder='搜索预设名称';search.setAttribute('aria-label','搜索酒馆预设');search.autocomplete='off';search.dataset.presetSearch='';
+    search.addEventListener('input',()=>renderTavernPresetPicker(picker));searchRow.append(search);panel.append(searchRow);
+    const list=el('div','pcm-picker-list');list.dataset.pickerList='';panel.append(list);
+    picker.append(panel);document.getElementById(APP_ID+'-dialog').append(picker);
+  }
+  picker.querySelector('[data-preset-search]').value='';renderTavernPresetPicker(picker);picker.classList.add('open');
+}
+function chooseTavernPreset(name){
+  const preset=tavernPresetPickerData.get(name);if(!preset)return;
+  replaceImportedPreset(tavernPresetPickerSide,clone(preset),name+'.json',name);
+  document.querySelector('[data-tavern-picker]')?.classList.remove('open');
+  pcmToastr.success('已从酒馆载入：'+name);
+}
+let pendingGroupSnapshot=null;function snapshotGroupChange(side){const isBatch=state.multiSelect.enabled&&(state.multiSelect.selected.old.size>1||state.multiSelect.selected.new.size>1);if(isBatch&&pendingGroupSnapshot?.side===side)return;const action=moveSnapshot(side);pushUndo(action);if(isBatch){pendingGroupSnapshot=action;queueMicrotask(()=>{if(pendingGroupSnapshot===action)pendingGroupSnapshot=null;});}}
+function renderMultiDelete(side){
+ const summary=document.querySelector('[data-summary="'+side+'"]');if(!summary)return;
+ summary.querySelector('.pcm-multi-actions')?.remove();
+ const count=state[side]?.prompts.filter(p=>state.multiSelect.selected[side].has(p.identifier)).length||0;
+ if(state.multiSelect.enabled&&count){const clear=btn('清空','clear-selected','pcm-multi-clear',side);clear.title='清空本侧全部选择（含筛选隐藏条目），不删除条目';const actions=el('span','pcm-multi-actions');actions.append(clear);const action=btn('删除已选','delete-selected','pcm-multi-delete',side);action.title='删除已选 '+count+' 个条目（可整批撤回）';actions.append(action);summary.append(actions);}
+}
+async function deleteSelectedPrompts(side){
+ const preset=state[side];if(!preset||!state.multiSelect.enabled)return;
+ const ids=new Set(preset.prompts.filter(p=>state.multiSelect.selected[side].has(p.identifier)).map(p=>p.identifier));if(!ids.size)return;
+ const before=JSON.stringify(preset);
+ if(!(await pcmConfirm('确定从'+(side==='old'?'旧版':'新版')+'删除已选的 '+ids.size+' 个条目吗？包含搜索或折叠后隐藏的已选条目，可整批撤回。')))return;
+ if(state[side]!==preset||JSON.stringify(preset)!==before){pcmToastr.warning('预设已变化，请重新选择后删除');return;}
+ pushUndo(moveSnapshot(side));
+ preset.prompts=preset.prompts.filter(p=>!ids.has(p.identifier));
+ for(const order of preset.prompt_order||[])if(Array.isArray(order.order))order.order=order.order.filter(item=>!ids.has(typeof item==='string'?item:item?.identifier));
+ const groups=getBaiBaiGroupState(preset);if(groups?.prompts)for(const id of ids)delete groups.prompts[id];
+ state.multiSelect.selected[side].clear();state.activeId=null;state.activeSide=null;state.freeSelect.oldId=null;state.freeSelect.newId=null;hideCompare();
+ if(state.grouping.side===side){state.grouping.side=null;state.grouping.startId=null;}
+ state.dirty[side]=true;rebuildCache();renderAll();pcmToastr.success('已删除 '+ids.size+' 个条目，可整批撤回');
+}
+async function deletePrompt(side,id){const preset=state[side];if(!preset)return;if(!(await pcmConfirm('确定从'+(side==='old'?'旧版':'新版')+'删除该条目吗？（可撤回）')))return;snapshotGroupChange(side);preset.prompts=preset.prompts.filter(p=>p.identifier!==id);const order=orderArray(preset),oi=order.findIndex(x=>(typeof x==='string'?x:x?.identifier)===id);if(oi>=0)order.splice(oi,1);if(isComparisonActive(side,id)){state.activeId=null;state.activeSide=null;hideCompare();}state.dirty[side]=true;rebuildCache();renderAll();pcmToastr.success('已删除条目');}
+function duplicatePrompt(side,id){
+  const preset=state[side],prompt=byId(side).get(id);if(!preset||!prompt)return;
+  snapshotGroupChange(side);
+  const copy=clone(prompt);copy.identifier=createIdentifier();copy.name=(prompt.name||'(未命名)')+' 副本';
+  copy.enabled=promptEnabled(side,prompt);
+  const order=promptOrderEntry(preset)?.order;
+  const orderIndex=order?.findIndex(item=>(typeof item==='string'?item:item?.identifier)===id);
+  if(orderIndex>=0)order.splice(orderIndex+1,0,{identifier:copy.identifier,enabled:copy.enabled});
+  preset.prompts.splice(preset.prompts.indexOf(prompt)+1,0,copy);
+  const groups=getBaiBaiGroupState(preset),groupId=groups?.prompts?.[id]?.groupId;
+  if(groupId&&Array.isArray(groups.groups)&&groups.groups.some(group=>String(group.id)===String(groupId)))ensureBaiBaiGroupState(preset).prompts[copy.identifier]={groupId:String(groupId)};
+  state.dirty[side]=true;rebuildCache();renderAll();pcmToastr.success('已复制条目');
+}
+function newGroup(side){
+  if(!state[side])return;
+  if(state.grouping.side===side){finishGrouping();return;}
+  state.grouping={side,startId:null,preset:state[side],baseline:JSON.stringify(state[side])};
+  state.query[side]='';state.filter[side]='all';
+  const search=document.querySelector('[data-search="'+side+'"]'),filter=document.querySelector('[data-filter="'+side+'"]');if(search)search.value='';if(filter)filter.value='all';
+  hideCompare();renderAll();
+}
+async function renameGroup(side,id){const groupState=getBaiBaiGroupState(state[side]),group=groupState?.groups?.find(g=>String(g.id)===String(id));if(!group)return;const name=await pcmPrompt('输入新的分组名称',group.name||'');if(!name)return;snapshotGroupChange(side);group.name=name;state.dirty[side]=true;renderList(side);}
+async function deleteGroup(side,id){
+  const preset=state[side],groupState=getBaiBaiGroupState(preset),group=groupState?.groups?.find(g=>String(g.id)===String(id));
+  if(!group)return;
+  const before=JSON.stringify(preset),source=state.tavernSource[side];
+  const count=preset.prompts.filter(p=>String(groupState.prompts?.[p.identifier]?.groupId)===String(id)).length;
+  const choice=await chooseGroupRemoval({parent:document.getElementById(APP_ID+'-dialog'),groupName:group.name,count});
+  if(choice!=='ungroup'&&choice!=='delete')return;
+  if(state[side]!==preset||state.tavernSource[side]!==source||JSON.stringify(preset)!==before){pcmToastr.warning('预设或分组已变化，请重新选择后操作');return;}
+  const result=removePresetGroup(preset,id,{deleteEntries:choice==='delete'});
+  // moveSnapshot 保留原条目对象；整组撤回也能找回未提交正文草稿。
+  pushUndo(moveSnapshot(side));
+  const ids=new Set(result.removedIds),closeDetail=ids.has(state.freeSelect[side+'Id'])||result.removedIds.some(promptId=>isComparisonActive(side,promptId));
+  Object.assign(preset,result.preset);
+  for(const promptId of ids)state.multiSelect.selected[side].delete(promptId);
+  if(ids.has(state.freeSelect[side+'Id'])){state.freeSelect.oldId=null;state.freeSelect.newId=null;}
+  if(closeDetail){state.activeId=null;state.activeSide=null;hideCompare();}
+  if(state.grouping.side===side)state.grouping={side:null,groupId:null};
+  state.dirty[side]=true;rebuildCache();renderAll();
+  pcmToastr.success(choice==='delete'?'已删除分组及 '+result.removedIds.length+' 个条目，可撤回':'已解除分组，条目已保留，可撤回');
+}
+function assignPromptToGroup(sourceSide,targetSide,id,groupId,skipUndo,resolution){
+  const source=state[sourceSide],target=state[targetSide],prompt=byId(sourceSide).get(id);
+  if(!source||!target||!prompt)return;
+  const groupState=ensureBaiBaiGroupState(target);
+  if(!groupState.groups.some(g=>String(g.id)===String(groupId)))return;
+  const plan=sourceSide!==targetSide?(resolution?new Map([[id,resolution]]):planDroppedPrompts(sourceSide,targetSide,[id])):null;
+  if(!skipUndo)snapshotGroupChange(targetSide);
+  let targetId=id;
+  if(sourceSide!==targetSide){
+    const ord=state.cache.ordered[targetSide];let last=-1;
+    for(let i=0;i<ord.length;i++){const gid2=groupState.prompts?.[ord[i].identifier]?.groupId;if(gid2&&String(gid2)===String(groupId))last=i;}
+    const beforeId=last>=0&&last+1<ord.length?ord[last+1].identifier:null;
+    targetId=movePrompt(sourceSide,targetSide,id,beforeId,true,true,plan.get(id));
+  }
+  if(!targetId)return;
+  groupState.prompts[targetId]={groupId:String(groupId)};state.dirty[targetSide]=true;rebuildCache();renderList(targetSide);
+  if(!skipUndo)notifyDroppedPrompts(plan,'条目已放置到分组');
+  return targetId;
+}
+function assignPromptsToGroup(sourceSide,targetSide,ids,groupId){
+  const validIds=[...new Set(ids)].filter(id=>byId(sourceSide).has(id)),moved=new Map();
+  if(!state[targetSide]||!validIds.length||!getBaiBaiGroupState(state[targetSide])?.groups?.some(g=>String(g.id)===String(groupId)))return moved;
+  const plan=planDroppedPrompts(sourceSide,targetSide,validIds);snapshotGroupChange(targetSide);
+  for(const id of validIds){const targetId=assignPromptToGroup(sourceSide,targetSide,id,groupId,true,plan?.get(id));if(targetId)moved.set(id,targetId);}
+  notifyDroppedPrompts(plan,'已批量放置 '+moved.size+' 个条目');return moved;
+}
+function togglePromptGroup(side,id){
+  const selection=state.grouping;if(!selection.side)return false;
+  if(selection.side!==side){pcmToastr.info('请在同一侧选择分组范围');return true;}
+  if(selection.pending)return true;
+  if(state[side]!==selection.preset||JSON.stringify(state[side])!==selection.baseline){finishGrouping();pcmToastr.warning('预设已变化，请重新选择分组范围');return true;}
+  if(!isInjected(side,byId(side).get(id))){pcmToastr.warning('请选择已注入列表中的条目');return true;}
+  if(!selection.startId){selection.startId=id;renderList(side);return true;}
+  selection.pending=true;
+  void completeRangeGroup(side,id,selection).catch(error=>{finishGrouping();pcmToastr.error(error.message);});
+  return true;
+}
+async function completeRangeGroup(side,endId,selection){
+  const ids=state.cache.ordered[side].filter(p=>isInjected(side,p)).map(p=>p.identifier);
+  const count=Math.abs(ids.indexOf(endId)-ids.indexOf(selection.startId))+1;
+  const name=await pcmPrompt('将两端及中间共 '+count+' 条归为一组（原分组归属会更新），请输入组名','新分组');
+  if(state.grouping!==selection)return;
+  if(!name){selection.pending=false;renderList(side);return;}
+  if(state[side]!==selection.preset||JSON.stringify(state[side])!==selection.baseline){finishGrouping();pcmToastr.warning('预设已变化，本次未创建分组');return;}
+  const result=createPromptRangeGroup(getBaiBaiGroupState(state[side]),ids,selection.startId,endId,name);
+  snapshotGroupChange(side);ensureBaiBaiGroupState(state[side]);state[side].extensions.baibaiToolkit.presetPromptGroups=result.state;
+  state.dirty[side]=true;state.groupCollapsed['g:'+side+':'+result.groupId]=false;finishGrouping();
+  pcmToastr.success('已分组 '+result.count+' 条；保存回酒馆后可在原生列表查看。本地文件请导出后导入酒馆。');
+}
+function finishGrouping(){state.grouping={side:null,groupId:null};renderAll();}
+function regexStatus(pair,oldScripts,newScripts){if(pair.oldIndex===null)return'added';if(pair.newIndex===null)return'removed';return equalValues(oldScripts[pair.oldIndex],newScripts[pair.newIndex])?'same':'changed';}
+function regexStatusText(status,side){if(status==='same')return'相同';if(status==='changed')return'配置有差异';return status==='removed'?(side==='old'?'新版缺少':'旧版独有'):(side==='new'?'新版新增':'旧版缺少');}
+const regexExpanded=new Set();let regexMulti=false;const regexDrafts=new WeakMap();const regexSeen={old:[],new:[]},regexSeenPreset={old:null,new:null};
+const regexSelected={old:new Set(),new:new Set()};
+function syncRegexSelection(side){
+  const scripts=getRegexScripts(state[side]);
+  const previous=regexSeenPreset[side]===state[side]?regexSeen[side]:[],byKey=new Map(),keyOf=script=>script.id?'id:'+script.id:'raw:'+JSON.stringify(script);
+  for(const script of previous){const key=keyOf(script);if(!byKey.has(key))byKey.set(key,[]);byKey.get(key).push(script);}
+  for(const script of scripts){const candidates=(byKey.get(keyOf(script))||[]).filter(old=>equalValues(old,script));if(candidates.length!==1)continue;const old=candidates[0];if(!regexDrafts.has(script)&&regexDrafts.has(old))regexDrafts.set(script,regexDrafts.get(old));if(regexSelected[side].has(old))regexSelected[side].add(script);}
+  regexSeen[side]=scripts.slice();regexSeenPreset[side]=state[side];
+  for(const script of regexSelected[side])if(!scripts.includes(script))regexSelected[side].delete(script);
+}
+function updateRegexSelection(side){
+  syncRegexSelection(side);
+  const column=document.querySelector('.pcm-regex-column[data-regex-side="'+side+'"]');
+  if(!column)return;
+  const scripts=getRegexScripts(state[side]),count=regexSelected[side].size;
+  for(const row of column.querySelectorAll('.pcm-regex-row')){
+    const selected=regexSelected[side].has(scripts[Number(row.dataset.regexIndex)]);
+    row.classList.toggle('pcm-regex-selected',selected);
+    row.querySelector('[data-regex-select]').checked=selected;
+  }
+  const all=column.querySelector('[data-regex-select-all]');
+  all.checked=!!scripts.length&&count===scripts.length;
+  all.indeterminate=count>0&&count<scripts.length;
+  all.disabled=!scripts.length;
+  const migrate=column.querySelector('[data-regex-migrate-selected]');
+  migrate.textContent='迁移所选'+(count?'（'+count+'）':'');
+  migrate.disabled=!count||!state[side==='old'?'new':'old'];for(const b of column.querySelectorAll('[data-needs-selection]'))b.disabled=!count;
+}
+function regexRow(side,index,scripts,pairs,oldScripts,newScripts){
+  const pair=pairs.find(item=>item[side+'Index']===index),targetSide=side==='old'?'new':'old',targetIndex=pair?.[targetSide+'Index'],status=regexStatus(pair,oldScripts,newScripts),script=scripts[index];
+  const row=el('article','pcm-regex-row'),top=el('div','pcm-regex-row-top'),toggle=el('button','pcm-regex-disclosure'),info=el('div','pcm-regex-info'),key=side+':'+String(script?.id||index);
+  row.dataset.regexSide=side;row.dataset.regexIndex=String(index);row.dataset.regexId=String(script?.id||'');
+  row.title='勾选多条后，拖动任意选中条目可一起迁移或排序；手机请长按后拖动';
+  const check=el('input','pcm-regex-select');check.type='checkbox';check.dataset.regexSelect='';check.hidden=!regexMulti;
+  check.setAttribute('aria-label','选择 '+(script?.scriptName||'未命名正则'));
+  check.checked=regexSelected[side].has(script);row.classList.toggle('pcm-regex-selected',check.checked);
+  check.addEventListener('change',()=>{if(check.checked)regexSelected[side].add(script);else regexSelected[side].delete(script);updateRegexSelection(side);});
+  toggle.type='button';toggle.setAttribute('aria-label','展开 '+(script?.scriptName||'未命名正则')+' 的内容');toggle.append(el('span','','›'));
+  info.append(el('strong','',script?.scriptName||'(未命名正则)'),el('span','pcm-badge pcm-'+status,regexStatusText(status,side)));
+  if(pair?.kind==='name')info.append(el('small','','按同名配对（ID 不同）'));
+  const action=btn(targetIndex==null?'迁移到'+(targetSide==='old'?'旧版':'新版'):'覆盖'+(targetSide==='old'?'旧版':'新版'),'migrate-regex',status==='same'?'':'pcm-primary',side);
+  action.dataset.regexIndex=String(index);action.disabled=!state[targetSide]||status==='same';if(status==='same')action.textContent='已一致';
+  const expanded=el('div','pcm-regex-expanded');expanded.append(createRegexEditor(script,{drafts:regexDrafts,onSave:patch=>regexMutation(side,()=>editRegexScript(state[side],index,patch))}));
+  const applyExpanded=open=>{row.classList.toggle('pcm-regex-expanded-open',open);expanded.hidden=!open;toggle.setAttribute('aria-expanded',String(open));toggle.title=open?'收起正则内容':'展开正则内容';};
+  toggle.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();const open=!row.classList.contains('pcm-regex-expanded-open');if(open)regexExpanded.add(key);else regexExpanded.delete(key);applyExpanded(open);});
+  top.append(check,toggle,info);if(!singleSide&&!tempLibrarySide)top.append(action);if(singleSide||tempLibrarySide)info.querySelectorAll('.pcm-badge,small').forEach(x=>x.remove());row.append(top,expanded);applyExpanded(regexExpanded.has(key));return row;
+}
+function regexMutation(side,mutate){const preset=state[side],original=preset.extensions,beforeExtensions=clone(original);preset.extensions=clone(original);try{mutate();}catch(error){preset.extensions=original;throw error;}if(equalValues(beforeExtensions,preset.extensions)){preset.extensions=original;return;}pushUndo({type:'regex',side,beforeExtensions});state.dirty[side]=true;renderList(side);renderRegexPanel();}
+async function deleteRegexSelection(side){const preset=state[side],scripts=getRegexScripts(preset),chosen=new Set(regexSelected[side]);if(!chosen.size)return;const before=JSON.stringify(preset.extensions);if(!await pcmConfirm('删除已选的 '+chosen.size+' 条正则？可整批撤回。'))return;if(state[side]!==preset||JSON.stringify(preset.extensions)!==before){pcmToastr.warning('正则已变化，请重新选择');return;}regexMutation(side,()=>deleteRegexScripts(preset,scripts.flatMap((x,i)=>chosen.has(x)?[i]:[])));}
+async function createRegexGroup(side){const preset=state[side],before=JSON.stringify(preset.extensions),chosen=new Set(regexSelected[side]);const name=await pcmPrompt(chosen.size?'将已选 '+chosen.size+' 条正则归为新组':'新建空分组名称','');if(!name?.trim())return;if(state[side]!==preset||JSON.stringify(preset.extensions)!==before){pcmToastr.warning('正则已变化，请重试');return;}const indexes=getRegexScripts(preset).flatMap((x,i)=>chosen.has(x)?[i]:[]);try{regexMutation(side,()=>groupRegexScripts(preset,indexes,name));}catch(e){pcmToastr.error(e.message);}}
+async function changeRegexGroup(side,id,remove){const preset=state[side],before=JSON.stringify(preset.extensions),g=getRegexGroupModel(preset).groups.find(x=>x.id===id);if(!g)return;const name=remove?await pcmConfirm('删除分组，组内正则保留为未分组？'):await pcmPrompt('分组名称',g.name);if(!name)return;if(state[side]!==preset||JSON.stringify(preset.extensions)!==before){pcmToastr.warning('正则已变化，请重试');return;}try{regexMutation(side,()=>remove?removeRegexGroup(preset,id):renameRegexGroup(preset,id,name));}catch(e){pcmToastr.error(e.message);}}
+function renderRegexGroup(side,group,scripts,pairs,oldScripts,newScripts){const section=el('section','pcm-regex-group');section.dataset.regexGroupId=group.id;section.dataset.regexSide=side;const head=el('header','pcm-regex-group-head');head.append(el('strong','',group.name),el('span','',group.scripts.length+' 条'));if(group.id!=='__ungrouped'){for(const [text,remove]of [['重命名',false],['删除组',true]]){const b=btn(text,'','');b.addEventListener('click',()=>changeRegexGroup(side,group.id,remove));head.append(b);}}section.append(head);const items=el('div','pcm-regex-group-items');for(const item of group.scripts)items.append(regexRow(side,item.index,scripts,pairs,oldScripts,newScripts));section.append(items);return section;}
+function renderRegexPanel(){
+  let panel=document.querySelector('[data-regex-panel]');const dialog=document.getElementById(APP_ID+'-dialog');
+  if(!panel){
+    panel=el('section','pcm-picker');panel.dataset.regexPanel='';const box=el('div','pcm-picker-panel pcm-regex-panel'),head=el('header','pcm-picker-head'),headActions=el('div','pcm-regex-head-actions');
+    const multi=btn('多选','','');multi.dataset.regexMulti='';multi.addEventListener('click',()=>{regexMulti=!regexMulti;regexSelected.old.clear();regexSelected.new.clear();renderRegexPanel();});headActions.append(multi);headActions.append(iconBtn('undo','撤回上一步操作',PCM_ICONS.undo),btn('×','close-regex','pcm-close'));head.append(el('div','pcm-regex-title','正则对比与迁移'),headActions);box.append(head);
+    const body=el('div','pcm-regex-body');body.dataset.regexBody='';box.append(body);panel.append(box);dialog?.append(panel);
+    panel._regexAbort=new AbortController();const options={signal:panel._regexAbort.signal};
+    window.addEventListener('blur',cleanupRegexDrag,options);
+    window.addEventListener('pointerup',onRegexPointerUp,options);
+    window.addEventListener('pointercancel',onRegexPointerCancel,options);
+    panel.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeRegexPanel();}});
+  }
+  panel.querySelector('[data-regex-multi]').setAttribute('aria-pressed',String(regexMulti));panel.classList.toggle('pcm-regex-single',!!(singleSide||tempLibrarySide));panel.querySelector('.pcm-regex-title').textContent=(singleSide||tempLibrarySide)?'正则编辑':'正则对比与编辑';const body=panel.querySelector('[data-regex-body]');if(!body)return;
+  const scroll={};for(const list of body.querySelectorAll('.pcm-regex-list'))scroll[list.dataset.regexSide]=list.scrollTop;
+  body.replaceChildren();const oldScripts=getRegexScripts(state.old),newScripts=getRegexScripts(state.new),pairs=pairRegexScripts(state.old,state.new);
+  for(const side of((singleSide||tempLibrarySide)?[singleSide||tempLibrarySide]:['old','new'])){
+    syncRegexSelection(side);const scripts=side==='old'?oldScripts:newScripts,column=el('section','pcm-regex-column');column.dataset.regexSide=side;
+    const model=getRegexGroupModel(state[side]),heading=el('header','pcm-regex-column-head');heading.append(el('h4','',side==='old'?'旧版正则':'新版正则'));
+    const controls=el('div','pcm-regex-selection-tools'),allLabel=el('label','pcm-regex-select-all'),all=el('input');all.type='checkbox';all.dataset.regexSelectAll='';all.setAttribute('aria-label','全选'+(side==='old'?'旧版':'新版')+'正则');
+    all.addEventListener('change',()=>{regexSelected[side].clear();if(all.checked)for(const script of scripts)regexSelected[side].add(script);updateRegexSelection(side);});
+    allLabel.append(all,el('span','','全选'));
+    const migrate=btn('迁移所选','','pcm-regex-batch-migrate');migrate.dataset.regexMigrateSelected='';migrate.title='将所选正则迁移到'+(side==='old'?'新版':'旧版')+'，已有对应项会覆盖；整批可撤回';
+    migrate.addEventListener('click',()=>migrateRegexSelection(side));const clear=btn('清空','','');clear.dataset.needsSelection='';clear.addEventListener('click',()=>{regexSelected[side].clear();updateRegexSelection(side);});const remove=btn('删除已选','','');remove.dataset.needsSelection='';remove.addEventListener('click',()=>deleteRegexSelection(side));controls.append(allLabel,clear,remove,migrate);controls.hidden=!regexMulti;migrate.hidden=!!(singleSide||tempLibrarySide);const group=btn('分组','','');group.addEventListener('click',()=>createRegexGroup(side));group.disabled=!state[side];heading.append(group,controls);column.append(heading);
+    const list=el('div','pcm-regex-list');list.dataset.regexSide=side;
+    if(!state[side])list.append(el('div','pcm-regex-empty','尚未导入'+(side==='old'?'旧版':'新版')+'预设'));
+    else if(!scripts.length&&!model.enabled)list.append(el('div','pcm-regex-empty','此预设没有 extensions.regex_scripts'));
+    else if(model.enabled)for(const group of model.groups)list.append(renderRegexGroup(side,group,scripts,pairs,oldScripts,newScripts));
+    else for(let index=0;index<scripts.length;index++)list.append(regexRow(side,index,scripts,pairs,oldScripts,newScripts));
+    column.append(list);body.append(column);updateRegexSelection(side);list.scrollTop=scroll[side]||0;
+  }
+  panel.classList.add('open');dialog?.classList.add('pcm-regex-open');updateUndoButton();
+}
+function openRegexPanel(){if(!state.old&&!state.new){pcmToastr.warning('请先导入至少一份预设');return;}renderRegexPanel();}
+function closeRegexPanel(){regexMulti=false;regexSelected.old.clear();regexSelected.new.clear();cleanupRegexDrag();const panel=document.querySelector('[data-regex-panel]');panel?._regexAbort?.abort();panel?.remove();document.getElementById(APP_ID+'-dialog')?.classList.remove('pcm-regex-open','pcm-regex-dragging');}
+function performRegexTransfer(sourceSide,targetSide,indexes,options={}){
+  if(!state[sourceSide]||!state[targetSide]){pcmToastr.error('请先导入两份预设');return;}
+  const beforeExtensions=state[targetSide].extensions===undefined?undefined:clone(state[targetSide].extensions);
+  try{
+    const result=transferRegexScripts(state[sourceSide],state[targetSide],sourceSide,indexes,options);
+    if(equalValues(beforeExtensions,state[targetSide].extensions))return;
+    pushUndo({type:'regex',side:targetSide,beforeExtensions});state.dirty[targetSide]=true;
+    regexSelected[sourceSide].clear();renderList(targetSide);renderRegexPanel();
+    pcmToastr.success(result.count+' 条正则已'+(sourceSide===targetSide?'调整位置':'迁移到'+(targetSide==='old'?'旧版':'新版'))+(result.overwritten?'（覆盖 '+result.overwritten+' 条）':'')+'，可整批撤回');
+  }catch(error){pcmToastr.error(error.message,'正则迁移失败');}
+}
+function migrateRegex(sourceSide,sourceIndex){performRegexTransfer(sourceSide,sourceSide==='old'?'new':'old',[sourceIndex]);}
+function migrateRegexSelection(side){syncRegexSelection(side);const indexes=getRegexScripts(state[side]).flatMap((script,index)=>regexSelected[side].has(script)?[index]:[]);if(indexes.length)performRegexTransfer(side,side==='old'?'new':'old',indexes);}
+
+let regexDrag=null,regexScrollRaf=0;
+function clearRegexDrop(){document.querySelectorAll('.pcm-regex-drop-before,.pcm-regex-drop-after,.pcm-regex-drop-group,.pcm-regex-drop-end').forEach(node=>node.classList.remove('pcm-regex-drop-before','pcm-regex-drop-after','pcm-regex-drop-group','pcm-regex-drop-end'));}
+function regexAutoScrollStep(){if(!regexDrag?.holding){regexScrollRaf=0;return;}const hit=document.elementFromPoint(regexDrag.mx,regexDrag.my),list=hit?.closest('.pcm-regex-list');if(list){const rect=list.getBoundingClientRect(),edge=Math.min(72,rect.height*.18),topDistance=regexDrag.my-rect.top,bottomDistance=rect.bottom-regexDrag.my;let delta=0;if(topDistance>=0&&topDistance<edge)delta=-Math.ceil(4+20*(1-topDistance/edge));else if(bottomDistance>=0&&bottomDistance<edge)delta=Math.ceil(4+20*(1-bottomDistance/edge));if(delta){const before=list.scrollTop;list.scrollTop+=delta;if(list.scrollTop!==before)processRegexDrag(regexDrag,regexDrag.mx,regexDrag.my);}}regexScrollRaf=requestAnimationFrame(regexAutoScrollStep);}
+function beginRegexDrag(){if(!regexDrag||regexDrag.holding)return;regexDrag.holding=true;for(const row of regexDrag.rows)row.classList.add('pcm-regex-dragging');regexDrag.dialog?.classList.add('pcm-regex-dragging');pcmLock();if(!regexScrollRaf)regexScrollRaf=requestAnimationFrame(regexAutoScrollStep);}
+function regexMovingRow(drag,row){return drag.targetSide===drag.sourceSide&&drag.indexes.includes(Number(row.dataset.regexIndex));}
+function markRegexDropAtRow(drag,row,after){
+  row.classList.add(after?'pcm-regex-drop-after':'pcm-regex-drop-before');drag.targetGroupId=row.closest('.pcm-regex-group')?.dataset.regexGroupId;
+  let next=after?row.nextElementSibling:row;
+  while(next?.matches('.pcm-regex-row')&&regexMovingRow(drag,next))next=next.nextElementSibling;
+  if(!next?.matches('.pcm-regex-row'))next=null;
+  drag.beforeId=next?.dataset.regexId||null;drag.beforeIndex=next?Number(next.dataset.regexIndex):null;
+}
+function processRegexDrag(drag,x,y){
+  clearRegexDrop();const hit=document.elementFromPoint(x,y),column=hit?.closest('.pcm-regex-column'),list=hit?.closest('.pcm-regex-list');
+  drag.targetSide=null;drag.beforeId=null;drag.beforeIndex=null;drag.targetGroupId=undefined;if(!column||!list)return;
+  drag.targetSide=column.dataset.regexSide;const group=hit.closest('.pcm-regex-group'),directRow=hit.closest('.pcm-regex-row');
+  if(directRow&&!regexMovingRow(drag,directRow)){const rect=directRow.getBoundingClientRect();markRegexDropAtRow(drag,directRow,y>rect.top+rect.height/2);return;}
+  if(group)drag.targetGroupId=group.dataset.regexGroupId;
+  const rows=[...(group||list).querySelectorAll('.pcm-regex-row')].filter(row=>!regexMovingRow(drag,row));
+  const nextRow=rows.find(row=>y<row.getBoundingClientRect().top+row.getBoundingClientRect().height/2);
+  if(nextRow)markRegexDropAtRow(drag,nextRow,false);else if(rows.length)markRegexDropAtRow(drag,rows.at(-1),true);else(group||list).classList.add(group?'pcm-regex-drop-group':'pcm-regex-drop-end');
+}
+function applyRegexDrop(drag){
+  if(!drag.targetSide)return;
+  for(const side of['old','new'])if(state[side]!==drag.presets[side]||state[side]?.extensions?.regex_scripts!==drag.scripts[side]){pcmToastr.warning('预设已更新，请重新选择正则后拖拽');return;}
+  if(!state[drag.sourceSide]||!state[drag.targetSide])return;
+  performRegexTransfer(drag.sourceSide,drag.targetSide,drag.indexes,{targetGroupId:drag.targetGroupId,beforeId:drag.beforeId,beforeIndex:drag.beforeIndex});
+}
+function clearRegexDragVisuals(drag){for(const row of drag.rows)row.classList.remove('pcm-regex-dragging');drag.dialog?.classList.remove('pcm-regex-dragging');clearRegexDrop();}
+function cleanupRegexDrag(){if(!regexDrag)return;clearTimeout(regexDrag.timer);if(regexScrollRaf)cancelAnimationFrame(regexScrollRaf);regexScrollRaf=0;const drag=regexDrag;regexDrag=null;clearRegexDragVisuals(drag);if(drag.holding)pcmUnlock();}
+function startRegexDrag(row,id,x,y,kind){
+  if(regexDrag)cleanupRegexDrag();const side=row.dataset.regexSide,index=Number(row.dataset.regexIndex),scripts=getRegexScripts(state[side]);syncRegexSelection(side);
+  const indexes=regexSelected[side].has(scripts[index])?scripts.flatMap((script,i)=>regexSelected[side].has(script)?[i]:[]):[index];
+  const rows=[...row.closest('.pcm-regex-list').querySelectorAll('.pcm-regex-row')].filter(item=>indexes.includes(Number(item.dataset.regexIndex)));
+  regexDrag={row,rows,indexes,presets:{old:state.old,new:state.new},scripts:{old:state.old?.extensions?.regex_scripts,new:state.new?.extensions?.regex_scripts},dialog:row.closest('.pcm-dialog'),pointerId:id,kind,x,y,mx:x,my:y,sourceSide:side,holding:false,timer:setTimeout(beginRegexDrag,kind==='touch'?420:280)};
+}
+function onRegexPointerDown(event){if(event.pointerType==='touch'||event.button!==0||event.target.closest('button,input,label,details,summary,.pcm-regex-expanded'))return;const row=event.target.closest?.('.pcm-regex-row');if(row)startRegexDrag(row,event.pointerId,event.clientX,event.clientY,'pointer');}
+function onRegexPointerMove(event){if(!regexDrag||regexDrag.kind!=='pointer'||event.pointerId!==regexDrag.pointerId)return;regexDrag.mx=event.clientX;regexDrag.my=event.clientY;if(!regexDrag.holding&&Math.hypot(event.clientX-regexDrag.x,event.clientY-regexDrag.y)>4)beginRegexDrag();if(regexDrag.holding){event.preventDefault();processRegexDrag(regexDrag,event.clientX,event.clientY);}}
+function finishRegexDrag(event,x,y){if(!regexDrag)return;clearTimeout(regexDrag.timer);if(regexScrollRaf)cancelAnimationFrame(regexScrollRaf);regexScrollRaf=0;const drag=regexDrag;regexDrag=null;try{if(drag.holding){processRegexDrag(drag,x,y);if(Math.hypot(x-drag.x,y-drag.y)>10){suppressClickUntil=performance.now()+400;applyRegexDrop(drag);event?.preventDefault?.();}}}finally{clearRegexDragVisuals(drag);if(drag.holding)pcmUnlock();}}
+function onRegexPointerUp(event){if(regexDrag?.kind==='pointer'&&event.pointerId===regexDrag.pointerId)finishRegexDrag(event,event.clientX,event.clientY);}
+function onRegexPointerCancel(event){if(regexDrag?.kind==='pointer'&&event.pointerId===regexDrag.pointerId)cleanupRegexDrag();}
+function onRegexTouchStart(event){if(event.touches.length!==1){cleanupRegexDrag();return;}if(event.target.closest('button,input,label,details,summary,.pcm-regex-expanded'))return;const row=event.target.closest?.('.pcm-regex-row');if(!row)return;const point=event.touches[0];startRegexDrag(row,point.identifier,point.clientX,point.clientY,'touch');}
+function onRegexTouchMove(event){if(!regexDrag||regexDrag.kind!=='touch')return;if(event.touches.length!==1){cleanupRegexDrag();return;}const point=touchById(event,regexDrag.pointerId);if(!point)return;regexDrag.mx=point.clientX;regexDrag.my=point.clientY;if(!regexDrag.holding){if(Math.hypot(point.clientX-regexDrag.x,point.clientY-regexDrag.y)>8)cleanupRegexDrag();return;}event.preventDefault();event.stopPropagation();processRegexDrag(regexDrag,point.clientX,point.clientY);}
+function onRegexTouchEnd(event){if(!regexDrag||regexDrag.kind!=='touch')return;let point=null;for(const item of event.changedTouches)if(item.identifier===regexDrag.pointerId){point=item;break;}if(point)finishRegexDrag(event,point.clientX,point.clientY);}
+function onRegexTouchCancel(){if(regexDrag?.kind==='touch')cleanupRegexDrag();}
+
+function onClick(event){if(performance.now()<suppressClickUntil)return;const target=event.target.closest('button');if(!target)return;const action=target.dataset.action;if(action==='toggle-temp-library'){if(tempLibrarySide===target.dataset.side)closeTempLibrary();else openTempLibrary(target.dataset.side);return;}if(action==='editor-settings'){showEditorSettings();return;}if(action==='migrate-added'){openAddedMigration();return;}if(action==='toggle-preset-group'){togglePresetGroupPower(target.dataset.side,target.dataset.groupId);return;}if(action==='toggle-draft-markers'){const side=target.dataset.side;state.showDraftMarkers[side]=!state.showDraftMarkers[side];syncDraftControls();refreshDraftIndicators(side);void saveUiPrefs();return;}if(action==='check-preset'){openCheck(target.dataset.side);return;}const groupElement=target.closest('.pcm-group');const groupId=groupElement?.dataset.groupId;const groupSide=groupElement?.dataset.groupSide||target.dataset.side;if(action==='text-replace'){openTextReplace(target.dataset.side,target.dataset.id);return;}if(action==='ai-stitch'){void openAiStitch();return;}if(action==='single-view'){setSingleSide(target.dataset.side);return;}if(action==='submit-version'){document.querySelector('.pcm-inline-form[data-side="'+target.dataset.side+'"]')?.requestSubmit();}if(action==='choose-tavern')chooseTavernPreset(target.dataset.presetName);if(action==='close-picker')document.querySelector('[data-tavern-picker]')?.classList.remove('open');if(action==='new-group')newGroup(target.dataset.side);if(action==='rename-group')renameGroup(groupSide,groupId);if(action==='delete-group')deleteGroup(groupSide,groupId);if(action==='finish-group')finishGrouping();if(action==='toggle-uninjected'){const side=target.dataset.side;state.unInjectedCollapsed[side]=!state.unInjectedCollapsed[side];renderList(side);}if(action==='toggle-group'){toggleRenderedGroup(target.dataset.side,target.dataset.groupKey);}if(action==='open-worldbook-workbench'){showWorldbookWorkbench();return;}if(action==='open-snapshots'){showSnapshots();return;}if(action==='open-editor'){showEditor();return;}if(action==='back-toolbox'){showToolbox();return;}if(action==='close'){void requestPanelClose();}if(action==='export')exportPreset(target.dataset.side);if(action==='save-tavern')saveSideToTavern(target.dataset.side);if(action==='pull-tavern')pullTavernPreset();if(action==='save-project')saveProject();if(action==='save-changes'){if(state.projectId)saveProject(document.querySelector('[data-project-name]')?.value.trim());else saveProject();}if(action==='load-project'){if(!selectedProjectId){pcmToastr.warning('请先点开项目名称输入框，从下拉列表选择要加载的项目');return;}loadProject(selectedProjectId);}if(action==='delete-project'){if(!selectedProjectId){pcmToastr.warning('请先点开项目名称输入框，从下拉列表选择要删除的项目');return;}void deleteProject(selectedProjectId);}if(action==='undo')undoLast();if(action==='manage-worldbook')manageWorldbook(target.dataset.side);if(action==='manage-regex')openRegexPanel();if(action==='close-regex')closeRegexPanel();if(action==='migrate-regex')migrateRegex(target.dataset.side,Number(target.dataset.regexIndex));if(action==='manage-vars')openVarPanel(target.dataset.side);if(action==='collapse'){state.activeId=null;state.activeSide=null;if(tempLibrarySide)resetTempLibrarySelection();else if(state.freeSelect.enabled){state.freeSelect={enabled:true,oldId:null,newId:null};markFreeSelection();}hideCompare();renderAll();}if(action==='migrate')migrate(target.dataset.side);if(action==='duplicate-prompt')duplicatePrompt(target.dataset.side,target.dataset.id);if(action==='clear-selected'&&state.multiSelect.enabled&&state.multiSelect.selected[target.dataset.side]){state.multiSelect.selected[target.dataset.side].clear();renderList(target.dataset.side);}if(action==='delete-selected')void deleteSelectedPrompts(target.dataset.side);if(action==='delete-prompt')deletePrompt(target.dataset.side,target.dataset.id);if(target.dataset.open){if(togglePromptGroup(target.dataset.side,target.dataset.open))return;if(state.multiSelect.enabled){toggleMultiSelect(target.dataset.side,target.dataset.open);return;}state.activeId=target.dataset.open;state.activeSide=target.dataset.side;renderAll(true,true);}}
+function onChange(event){if(event.target.dataset.file&&event.target.files[0])loadFile(event.target.dataset.file,event.target.files[0]);if(event.target.dataset.filter){const side=event.target.dataset.filter;state.filter[side]=event.target.value;renderList(side);}}
+const searchTimers={old:null,new:null};
+function onInput(event){if(event.target.dataset.search){const side=event.target.dataset.search;state.query[side]=event.target.value;clearTimeout(searchTimers[side]);searchTimers[side]=setTimeout(()=>{renderList(side);document.querySelector('[data-compare]')?.dispatchEvent(new Event('pcm-search-refresh'));},150);}}
+function openDialogSafe(dialog){applyUiTheme();try{if(typeof dialog.showModal==='function')dialog.showModal();else dialog.setAttribute('open','');}catch(error){console.error('[preset-compare-migrator] open failed',error);dialog.setAttribute('open','');}}
+const PCM_ICONS={home:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 10 9-7 9 7"/><path d="M5 9v11h14V9"/><path d="M9 20v-6h6v6"/></svg>',load:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 14l1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5c0-1.1.9-2 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2"/></svg>',save:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',trash:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',undo:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',import:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',exportIcon:'<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>'};
+function iconBtn(action,title,svg,cls){const b=el('button','menu_button pcm-icon-btn'+(cls?' '+cls:''));b.type='button';b.dataset.action=action;b.title=title;b.setAttribute('aria-label',title);b.innerHTML=svg;return b;}
+let selectedProjectId=null;
+function toggleProjList(force){const dropEl=document.querySelector('.pcm-proj-drop');if(!dropEl)return;const open=force!==undefined?force:!dropEl.classList.contains('open');if(open)refreshProjList();dropEl.classList.toggle('open',open);}
+async function refreshProjList(projects){const list=document.querySelector('[data-proj-list]');if(!list)return;try{projects=projects||await listProjects();}catch(error){list.replaceChildren(el('div','pcm-proj-empty','项目列表读取失败：'+error.message));return;}list.replaceChildren();if(!projects.length){list.append(el('div','pcm-proj-empty','暂无已保存项目'));return;}for(const p of projects){const item=el('button','pcm-proj-item');item.type='button';item.textContent=p.name+' · '+new Date(p.updatedAt).toLocaleString();item.title=p.name;item.addEventListener('click',()=>{const input=document.querySelector('[data-project-name]');if(input)input.value=p.name;selectedProjectId=p.id;toggleProjList(false);});list.append(item);}}
+document.addEventListener('click',event=>{if(!event.target.closest?.('.pcm-proj-drop'))toggleProjList(false);});
+async function startApplication(){
+  await host.ready();
+  await loadUiPrefs();
+  try{setEditorPreferences(await host.request('preset-editor-preferences'));}catch(error){console.warn('[preset-compare-migrator] editor preferences unavailable',error);}
+  watchTavernPresetEvents();
+  host.on('open',payload=>{try{const dialog=shell();openDialogSafe(dialog);if(payload?.editorQuick)showEditor();else showToolbox();}catch(error){console.error('[preset-compare-migrator] init failed',error);pcmToastr.error(error.message,APP_TITLE+'启动失败');}});
+  host.on('host-closed',()=>{const dialog=document.getElementById(APP_ID+'-dialog');if(!dialog)return;if(dialog.open)dialog.close();else destroyPanel(dialog);});
+  await host.notify('ready');
+}
+startApplication().catch(error=>console.error('[preset-compare-migrator] bootstrap failed',error));

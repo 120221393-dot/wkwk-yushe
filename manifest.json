@@ -1,0 +1,14 @@
+{
+  "display_name": "预设更新编辑器",
+  "loading_order": 110,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "author": "120221393-dot",
+  "version": "2.1.4",
+  "homePage": "https://github.com/120221393-dot/wkwk-yushe",
+  "auto_update": true,
+  "hooks": {
+    "update": "reloadAfterUpdate"
+  }
+}
