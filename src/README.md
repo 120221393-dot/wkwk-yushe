@@ -9,7 +9,7 @@
 - `ui/app.js`：iframe 应用协调入口，组装各功能页面。
 - `ui/index.html`：iframe HTML 入口，通过 module script 和 stylesheet link 加载资源。
 - `ui/bridge/`：iframe 与宿主之间的专用消息通道。
-- `ui/home/`、`ui/styles/`、`ui/assets/`：首页、公共样式和图片资源。
+- `ui/home/`、`ui/styles/`：首页与公共样式。
 
 根目录 `index.js` 只导入并启动 `host/host.js`。JavaScript 使用显式 `import` / `export` 连接；CSS 由 iframe HTML 引用，图片由模块 URL 引用。不要向酒馆主页面注入功能 CSS，不要让运行时代码导入 `tests/`。
 

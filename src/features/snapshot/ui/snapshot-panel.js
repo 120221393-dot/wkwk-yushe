@@ -10,7 +10,7 @@ import {folderCardTargets,createLibraryGrouping} from '../../../ui/library-folde
 export function searchSnapshotNames(snapshots,text){const query=String(text||'').trim().toLocaleLowerCase();return snapshots.filter(s=>String(s.name||'').toLocaleLowerCase().includes(query));}
 export function createSnapshotPanel({host, onBack, onClose, onCycleTheme, themeIcon, prompt, confirm, toast, quick=false}) {
   const node = (tag, cls, text) => {const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n;};
-  const element = node('main', 'pcm-snapshots pcm-api-manager pcm-snapshot-manager');
+  const element = node('main', 'pcm-snapshots pcm-snapshot-manager');
   element.setAttribute('aria-label', '设置快照');
   const header = node('header', 'pcm-snapshot-header');
   const back = iconButton('首页', 'home', () => editor ? closeEditor() : onBack()), title = node('h2', '', '设置快照');

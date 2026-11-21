@@ -12,10 +12,7 @@ const OPERATIONS = Object.freeze({
   'snapshot-share-export':'准备快照分享文件', 'snapshot-share-download':'导出快照文件',
   'snapshot-share-preview':'预检快照资源', 'snapshot-share-import':'导入快照副本',
   'snapshot-preset-options':'读取快照可选预设', 'snapshot-retarget-preset':'重新指定快照预设',
-  'api-manager-list':'读取 API 方案', 'api-manager-links':'读取 API 绑定', 'api-manager-models':'拉取 API 模型',
-  'api-manager-native-list':'读取原生连接列表', 'api-manager-native-import':'导入原生连接', 'api-manager-preflight':'检查 API 连接',
-  'api-manager-save':'保存 API 方案', 'api-manager-delete':'删除 API 方案', 'api-manager-bind':'绑定 API 方案',
-  'api-manager-apply':'切换 API 方案', 'api-manager-preferences':'更新快捷入口', 'other':'其他操作',
+  'other':'其他操作',
 });
 const OUTCOMES = Object.freeze({pending:'等待中',success:'成功',failed:'失败',timeout:'超时',cancelled:'已取消'});
 const ERRORS = Object.freeze({Error:'请求失败',TypeError:'接口或网络异常',SyntaxError:'数据格式异常',RangeError:'数据范围异常',AbortError:'已取消',NotAllowedError:'权限受限',QuotaExceededError:'本地空间不足',DataCloneError:'数据无法传递'});

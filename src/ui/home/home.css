@@ -1,4 +1,4 @@
-/* 酒馆盒子首页：原尺寸功能卡片、原创小猫背景字画及右下角翻转彩蛋。 */
+/* 酒馆盒子首页：功能卡片。 */
 .pcm-toolbox-home{
   --home-bg:var(--SmartThemeBlurTintColor);--home-text:var(--SmartThemeBodyColor);
   --home-surface:color-mix(in srgb,var(--home-bg) 93%,#f4d9b2);
