@@ -1793,7 +1793,7 @@ async function installApiEntries(controller) {
     button.addEventListener('click', event => {
       event.preventDefault(); event.stopPropagation();
       if (id === ballId && moved) { moved = false; return; }
-      controller.open(false, true);
+      controller.open(true);
     }); return button;
   };
   const placeBall = () => {

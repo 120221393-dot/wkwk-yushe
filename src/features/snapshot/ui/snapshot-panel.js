@@ -1,5 +1,4 @@
 // 设置快照页面：保存、恢复与聊天/角色绑定；区分保存失败与回读未确认，支持只读重新核验。
-import { chooseApiSnapshotBinding } from '../../api/ui/api-snapshot-bind.js';
 import { createSnapshotEditor } from './snapshot-editor.js';
 import { createSnapshotSharing } from './snapshot-share-dialog.js';
 import {chooseSnapshotPreset} from './snapshot-preset-dialog.js';
@@ -212,7 +211,7 @@ export function createSnapshotPanel({host, onBack, onClose, onCycleTheme, themeI
       const character = button('绑定此角色', () => execute('bind', {...snapshot, target: 'character'}));
       chat.dataset.unavailable = String(!c.canBindChat); character.dataset.unavailable = String(!c.canBindCharacter);
       top.append(apply);
-      actions.append(button('绑定api',async()=>{try{await chooseApiSnapshotBinding({host,parent:element,snapshotId:snapshot.id});}catch(error){showStatus(error.message,true);}}), chat, character, sharing.single(snapshot));
+      actions.append(chat, character, sharing.single(snapshot));
       card.append(top, favoriteStatus, range, summary, mounts);
       if(included.reasoning)card.append(node('p','pcm-snapshot-summary','推理设置：'+(snapshot.reasoning?.name||'自定义格式')+(snapshot.reasoning?.version===1?'（旧版解析绑定）':'')));
       card.append(actions);cardTarget(snapshot.id).append(card);
