@@ -1828,8 +1828,15 @@ async function installApiEntries(controller) {
       const form = document.getElementById('send_form');
       if (form && !document.getElementById(railId)) {
         const rail = document.createElement('div'); rail.id = railId;
-        applyImportantStyles(rail, {display:'flex', visibility:'visible', opacity:'1', 'justify-content':'center',
-          'flex':'0 0 100%', 'grid-column':'1 / -1', order:'-1', width:'100%', 'min-height':'34px', padding:'2px', position:'relative', 'box-sizing':'border-box'});
+        // 关键修复：不能 flex:0 0 100% 独占一行。ST 的 #send_form 是
+        // flex-wrap:wrap，独占一行的子元素会把 leftSendForm/输入区/
+        // rightSendForm（发送键）整体挤到下一行，输入法一弹发送键就被
+        // 挡在视口外——表现为「发送键消失」。改为作为普通 flex 项参与
+        // 排布，紧跟在左侧按钮区后面，不触发换行。
+        applyImportantStyles(rail, {display:'flex', visibility:'visible', opacity:'1', 'align-items':'center',
+          'flex':'0 0 auto', order:'-1', 'min-width':'0', 'min-height':'var(--bottomFormBlockSize)',
+          height:'var(--bottomFormBlockSize)', padding:'2px', position:'relative', 'box-sizing':'border-box',
+          'max-width':'40%'});
         rail.append(make(qrId, '预设编辑')); form.prepend(rail);
       }
     }
